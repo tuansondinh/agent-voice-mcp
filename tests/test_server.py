@@ -168,11 +168,14 @@ class TestSpeakMessage:
         result = server.speak_message_impl(text=text)
         assert result["chars"] == 50
 
-    def test_speak_message_does_not_call_set_tts_playing(self):
-        """speak_message_impl must NOT call set_tts_playing (AEC handles echo)."""
+    def test_speak_message_calls_set_tts_playing(self):
+        """speak_message_impl sets TTS flag; on fallback path also drains after."""
         server, mock_tts, mock_listener = _make_server()
+        server._use_macos_aec = False  # ensure fallback path for this test
         server.speak_message_impl(text="Hello")
-        mock_listener.set_tts_playing.assert_not_called()
+        mock_listener.set_tts_playing.assert_any_call(True)
+        mock_listener.set_tts_playing.assert_any_call(False)
+        mock_listener.drain_queue.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

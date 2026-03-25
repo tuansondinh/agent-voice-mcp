@@ -437,12 +437,18 @@ class TestSpeakMessageNoSetTTSPlaying:
         s.tts = mock_tts
         return s
 
-    def test_speak_message_does_not_call_set_tts_playing(self):
-        """speak_message_impl should not call set_tts_playing on the listener."""
+    def test_speak_message_calls_set_tts_playing(self):
+        """speak_message_impl sets TTS flag for fallback gate + drains after.
+
+        On the fallback path (_use_macos_aec=False), drain_queue is called.
+        """
         server = self._make_server()
+        server._use_macos_aec = False  # ensure fallback path
         server._listener = MagicMock()
         server.speak_message_impl(text="Hello")
-        server._listener.set_tts_playing.assert_not_called()
+        server._listener.set_tts_playing.assert_any_call(True)
+        server._listener.set_tts_playing.assert_any_call(False)
+        server._listener.drain_queue.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -450,8 +456,8 @@ class TestSpeakMessageNoSetTTSPlaying:
 # ---------------------------------------------------------------------------
 
 
-class TestAskSingleNoSleepNoDrain:
-    """_ask_single should not sleep 0.6s or call drain_queue() after TTS."""
+class TestAskSingleEchoTailDrain:
+    """_ask_single should sleep for echo tail and drain queue after TTS."""
 
     def _make_server(self):
         mock_tts = _make_mock_tts()
@@ -466,32 +472,22 @@ class TestAskSingleNoSleepNoDrain:
         s.tts = mock_tts
         return s
 
-    def test_ask_single_returns_quickly_no_long_sleep(self):
-        """Without the 0.6s sleep, a disabled-listening turn should return fast."""
+    def test_drain_queue_called_after_tts(self):
+        """drain_queue should be called in _ask_single after echo tail.
+
+        On the fallback path (_use_macos_aec=False), drain_queue is called.
+        """
         server = self._make_server()
-        server.toggle_listening_impl(enabled=False)
-
-        start = time.monotonic()
-        result = server.ask_user_voice_impl(questions=["Quick test?"])
-        elapsed = time.monotonic() - start
-
-        # With 0.6s sleep removed, this should complete in < 0.5s
-        assert elapsed < 0.5, (
-            f"_ask_single took {elapsed:.2f}s — the 0.6s sleep should have been removed"
-        )
-
-    def test_drain_queue_not_called_after_tts(self):
-        """drain_queue should not be called in _ask_single after TTS finishes."""
-        server = self._make_server()
+        server._use_macos_aec = False  # ensure fallback path
         mock_listener = MagicMock()
         mock_listener.barge_in = threading.Event()
+        mock_listener.is_active = True
         mock_listener.get_next_speech = MagicMock(return_value=None)
         server._listener = mock_listener
 
-        result = server._ask_single("Test question?")
+        server._ask_single("Test question?")
 
-        # drain_queue should not be called as part of the echo-tail cleanup
-        mock_listener.drain_queue.assert_not_called()
+        mock_listener.drain_queue.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

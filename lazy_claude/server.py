@@ -24,6 +24,8 @@ import sys
 import threading
 import time
 from io import TextIOWrapper
+
+import numpy as np
 from typing import Any
 
 # stdout_guard MUST be imported first so that the real stdout fd is
@@ -60,31 +62,144 @@ class VoiceServer:
     busy : bool
         True while a voice turn is in progress.  Concurrent calls are
         rejected immediately.
-    tts : TTSEngine
+    tts : TTSEngine | MacOSTTSEngine
         Shared TTS engine instance.
+    _use_macos_aec : bool
+        True when the macOS AVAudioEngine backend is active (system AEC).
+        False when using the sounddevice fallback with custom AEC.
     """
 
     def __init__(self) -> None:
         _log("Initialising VoiceServer…")
 
-        # Shared AEC components wired between TTSEngine and ContinuousListener.
-        # The ReferenceBuffer accepts 24kHz from TTS and provides 16kHz to the listener.
-        self._ref_buf = ReferenceBuffer(write_sr=24_000, read_sr=16_000)
-        self._echo_canceller = EchoCanceller()
+        self._use_macos_aec: bool = False
 
-        self.tts = TTSEngine(ref_buf=self._ref_buf)
-        self._whisper_model = load_model()
-        self._vad_model = load_vad_model()
-        self._listener = ContinuousListener(
-            self._vad_model,
-            ref_buf=self._ref_buf,
-            echo_canceller=self._echo_canceller,
-        )
+        # --- Attempt macOS AVAudioEngine backend ---
+        if sys.platform == 'darwin':
+            self._use_macos_aec = self._try_init_macos_backend()
+
+        # --- Fallback: sounddevice + custom AEC ---
+        if not self._use_macos_aec:
+            _log("Using sounddevice fallback backend with custom AEC.")
+            self._ref_buf = ReferenceBuffer(write_sr=24_000, read_sr=16_000)
+            self._echo_canceller = EchoCanceller(
+                mu=0.4,
+                enable_res=True,
+            )
+            self.tts = TTSEngine(ref_buf=self._ref_buf)
+            self._whisper_model = load_model()
+            self._vad_model = load_vad_model()
+            self._listener = ContinuousListener(
+                self._vad_model,
+                ref_buf=self._ref_buf,
+                echo_canceller=self._echo_canceller,
+            )
+            # Run AEC calibration at startup on the fallback path only
+            self._calibrate_aec()
 
         self.listening: bool = True
         self.busy: bool = False
         self._lock = threading.Lock()
         _log("VoiceServer ready.")
+
+    def _try_init_macos_backend(self) -> bool:
+        """Try to initialise the macOS AVAudioEngine backend.
+
+        Returns True if successful, False if any step fails (import error,
+        init error, no mic permission).  Logs a warning on failure.
+        """
+        try:
+            from lazy_claude.av_audio import (
+                AVAudioBackend,
+                MacOSContinuousListener,
+                MacOSTTSEngine,
+            )
+        except ImportError as exc:
+            _log(f"WARNING: lazy_claude.av_audio import failed — falling back to sounddevice: {exc}")
+            return False
+
+        try:
+            # Create a shared backend instance for the listener
+            backend = AVAudioBackend()
+
+            # Whisper model (needed for STT regardless of audio backend)
+            self._whisper_model = load_model()
+            self._vad_model = load_vad_model()
+
+            # Instantiate macOS-native listener and TTS
+            self._listener = MacOSContinuousListener(self._vad_model)
+            self.tts = MacOSTTSEngine()
+
+            _log("Using macOS AVAudioEngine backend with system AEC.")
+            return True
+
+        except Exception as exc:
+            _log(f"WARNING: macOS AVAudioEngine backend init failed — falling back: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # AEC calibration (fallback path only)
+    # ------------------------------------------------------------------
+
+    def _calibrate_aec(self) -> None:
+        """Play a quiet chirp through speakers to train the AEC filter.
+
+        A 1.5-second logarithmic frequency sweep (200-4000 Hz) at low volume
+        is played while the mic is active. The adaptive filter uses this known
+        signal to learn the room impulse response, so echo cancellation works
+        from the very first real TTS utterance.
+
+        Only called on the sounddevice fallback path — system AEC (macOS) does
+        not require calibration.
+        """
+        import sounddevice as sd
+
+        _log("AEC calibration: starting chirp…")
+
+        # Activate listener so the mic callback runs during calibration
+        was_active = self._listener.is_active
+        if not was_active:
+            self._listener.set_active(True)
+
+        try:
+            # Generate a logarithmic chirp at 24kHz (matches TTS output rate)
+            chirp_sr = 24_000
+            duration = 1.5  # seconds
+            t = np.linspace(0, duration, int(chirp_sr * duration), dtype=np.float32)
+            f0, f1 = 200.0, 4000.0
+            chirp = 0.05 * np.sin(  # low amplitude — barely audible
+                2 * np.pi * f0 * duration / np.log(f1 / f0)
+                * (np.exp(t / duration * np.log(f1 / f0)) - 1)
+            ).astype(np.float32)
+
+            # Push chirp into AEC reference buffer (same path as TTS)
+            # and play through speakers simultaneously
+            chunk_size = 1024  # samples per write at 24kHz
+            with sd.OutputStream(
+                samplerate=chirp_sr,
+                channels=1,
+                dtype='float32',
+            ) as stream:
+                for i in range(0, len(chirp), chunk_size):
+                    chunk = chirp[i:i + chunk_size]
+                    if len(chunk) < chunk_size:
+                        chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                    # Write to ref buffer BEFORE playing (same as TTS path)
+                    self._ref_buf.write(chunk)
+                    stream.write(chunk.reshape(-1, 1))
+
+            # Let the last echo tail settle
+            time.sleep(0.5)
+            self._listener.drain_queue()
+
+            _log("AEC calibration: done. Filter should be partially converged.")
+
+        except Exception as exc:
+            _log(f"WARNING: AEC calibration failed (non-fatal): {exc}")
+        finally:
+            # Restore listener state
+            if not was_active:
+                self._listener.set_active(False)
 
     # ------------------------------------------------------------------
     # Tool implementations (plain Python — called by MCP tool wrappers)
@@ -100,14 +215,23 @@ class VoiceServer:
     def speak_message_impl(self, *, text: str) -> dict[str, Any]:
         """Speak text via TTS and return a status dict.
 
-        AEC (via TTSEngine's ref_buf) handles echo suppression — no need to
-        gate the listener here.
+        On macOS path: system AEC handles echo instantly — no sleep or drain.
+        On fallback path: wait for echo tail and drain any residual.
         """
         _log(f"speak_message: {len(text)} chars")
+        self._listener.set_tts_playing(True)
         try:
             self.tts.speak(text)
         except Exception as exc:
             _log(f"WARNING: TTS error during speak_message: {exc}")
+        finally:
+            self._listener.set_tts_playing(False)
+
+        if not self._use_macos_aec:
+            # Fallback path: wait for echo tail to pass, then drain any residual
+            time.sleep(0.8)
+            self._listener.drain_queue()
+
         return {"status": "spoken", "chars": len(text)}
 
     def ask_user_voice_impl(self, *, questions: list[str]) -> str:
@@ -138,10 +262,14 @@ class VoiceServer:
     def _ask_single(self, question: str) -> str:
         """Speak one question via TTS (with barge-in), then transcribe answer.
 
-        AEC handles echo suppression — no post-TTS sleep or drain needed.
-        The lightweight _tts_active flag on the listener enables the fallback gate.
+        On macOS path: system AEC handles echo instantly — no post-TTS sleep or drain.
+        On fallback path: wait 0.8s for echo tail, then drain residual echo.
         """
         _log(f"Speaking question: {question!r}")
+
+        # Ensure the listener is active (mic collecting speech).
+        if not self._listener.is_active:
+            self._listener.set_active(True)
 
         # Prepare listener for this TTS turn
         self._listener.clear_barge_in()
@@ -163,6 +291,11 @@ class VoiceServer:
 
         tts_thread.join(timeout=2.0)
         self._listener.set_tts_playing(False)
+
+        if not self._use_macos_aec:
+            # Fallback path: wait for echo tail to pass, then drain any residual echo
+            time.sleep(0.8)
+            self._listener.drain_queue()
 
         if not self.listening:
             _log("Listening disabled — skipping mic recording.")
