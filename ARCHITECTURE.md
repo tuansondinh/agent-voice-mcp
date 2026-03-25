@@ -17,6 +17,84 @@ lazy-claude provides voice input/output integration for Claude Code with **two s
 
 Both paths expose the same MCP tool API: `ask_user_voice`, `speak_message`, `toggle_listening`.
 
+### Audio Flow Architecture (Mermaid)
+
+```mermaid
+graph TD
+    subgraph API["MCP API Layer"]
+        A["ask_user_voice()"]
+        B["speak_message()"]
+    end
+
+    subgraph macOS["macOS System AEC Path"]
+        M1["AVAudioBackend<br/>AVAudioEngine with<br/>Voice Processing IO"]
+        M2["Mic Tap<br/>44.1kHz raw audio"]
+        M3["Resample<br/>44.1k → 16kHz"]
+        M4["AudioRechunker<br/>→ 512-sample frames"]
+        M5["Silero VAD<br/>Speech detection"]
+        M6["Barge-in Detector<br/>Speech during TTS"]
+        M7["MacOSContinuousListener<br/>Utterance assembly"]
+
+        TM1["Kokoro TTS<br/>Text → 24kHz audio"]
+        TM2["Resample<br/>24k → 44.1kHz"]
+        TM3["AVAudioPlayerNode<br/>Playback"]
+    end
+
+    subgraph Fallback["Fallback Path<br/>Non-macOS or Failure"]
+        F1["sounddevice<br/>Mic + Speaker streams"]
+        F2["ReferenceBuffer<br/>TTS reference copy"]
+        F3["EchoCanceller<br/>PBFDLMS adaptive filter"]
+        F4["Residual Suppression<br/>Post-AEC echo removal"]
+        F5["Silero VAD<br/>Speech detection"]
+        F6["Barge-in Detector"]
+        F7["ContinuousListener<br/>Utterance assembly"]
+
+        TF1["Kokoro TTS<br/>Text → 24kHz audio"]
+        TF2["TTSEngine<br/>sounddevice OutputStream"]
+    end
+
+    subgraph STT["Speech-to-Text"]
+        W["Whisper<br/>16kHz audio → text"]
+    end
+
+    A -->|"Path selection:<br/>macOS?"| macOS
+    A -->|fallback| Fallback
+    B -->|"Path selection:<br/>macOS?"| macOS
+    B -->|fallback| Fallback
+
+    M1 -->|mic input| M2
+    M2 --> M3
+    M3 --> M4
+    M4 --> M5
+    M5 --> M6
+    M6 -->|"speech during TTS<br/>or normal speech"| M7
+    M7 -->|16kHz audio| W
+
+    TM1 -->|24kHz audio| TM2
+    TM2 -->|44.1kHz samples| M1
+    M1 -->|playback| TM3
+
+    F1 -->|mic| F2
+    F1 -->|speaker| F2
+    F2 --> F3
+    F3 --> F4
+    F4 --> F5
+    F5 --> F6
+    F6 --> F7
+    F7 -->|16kHz audio| W
+
+    TF1 -->|24kHz audio| F2
+    TF1 --> TF2
+    TF2 -->|speaker| F1
+
+    W -->|transcribed text| C["Return to Claude"]
+
+    style macOS fill:#c8e6c9,stroke:#2e7d32
+    style Fallback fill:#bbdefb,stroke:#1565c0
+    style STT fill:#fff9c4,stroke:#f57f17
+    style API fill:#f3e5f5,stroke:#6a1b9a
+```
+
 ---
 
 ## Component Architecture
