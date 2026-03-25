@@ -194,7 +194,7 @@ class VadStateMachine:
 
     def __init__(
         self,
-        silence_duration: float = 1.0,
+        silence_duration: float = 0.5,
         min_speech_duration: float = 0.5,
         no_speech_timeout: float = 15.0,
         sample_rate: int = SAMPLE_RATE,
@@ -318,7 +318,7 @@ def _resample_to_16k(audio: np.ndarray, from_rate: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def record_audio(
-    silence_duration: float = 1.0,
+    silence_duration: float = 0.5,
     min_speech_duration: float = 0.5,
     no_speech_timeout: float = 15.0,
     vad_model: SileroVAD | None = None,
@@ -465,7 +465,7 @@ class ContinuousListener:
     BARGE_IN_FRAMES: int = 3            # consecutive high-prob frames to confirm barge-in
 
     # Utterance segmentation
-    SILENCE_DURATION: float = 1.0       # seconds of trailing silence to stop
+    SILENCE_DURATION: float = 0.5       # seconds of trailing silence to stop
     MIN_SPEECH_DURATION: float = 0.5    # minimum speech before a stop is honoured
 
     # Fallback gate: if AEC residual RMS power exceeds this during TTS → suppress chunk.

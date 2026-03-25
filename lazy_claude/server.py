@@ -41,7 +41,7 @@ from lazy_claude.stdout_guard import get_mcp_stdout  # noqa: E402 (intentional e
 ENV_LAZY_CLAUDE_ALWAYS_ON = "LAZY_CLAUDE_ALWAYS_ON"
 _VOICE_SUBMIT_KEYWORD_RE = re.compile(r"(?i)\bover\b[\s.!?,:;]*$")
 _INITIAL_RESPONSE_TIMEOUT = 60.0
-_CONTINUATION_RESPONSE_TIMEOUT = 5.0
+_CONTINUATION_RESPONSE_TIMEOUT = 3.0
 
 
 # All logging goes to stderr.
@@ -287,8 +287,8 @@ class VoiceServer:
     def _ask_single(self, question: str) -> str:
         """Speak one question via TTS (with barge-in), then transcribe answer.
 
-        The listener segments audio after ~1.5s of silence. At the server layer
-        we keep the answer open for up to 5s between segments so the user can
+        The listener segments audio after ~0.5s of silence. At the server layer
+        we keep the answer open for up to 3s between segments so the user can
         pause naturally. A segment ending in ``OVER`` submits immediately.
 
         On macOS path: system AEC handles echo instantly — no post-TTS sleep

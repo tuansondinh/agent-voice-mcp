@@ -568,7 +568,7 @@ class MacOSContinuousListener:
 
     NORMAL_THRESHOLD: float = 0.5
     BARGE_IN_FRAMES: int = 3
-    SILENCE_DURATION: float = 1.0
+    SILENCE_DURATION: float = 0.5
     MIN_SPEECH_DURATION: float = 0.5
 
     def __init__(self, vad_model: Any, backend: "AVAudioBackend") -> None:

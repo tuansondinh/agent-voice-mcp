@@ -1,10 +1,10 @@
 {
-  "name": "@tuan_son.dinh/claude-voice",
-  "version": "0.1.1",
-  "description": "Voice MCP server for Claude Code — hands-free voice input/output via TTS + Whisper",
+  "name": "@tuan_son.dinh/agent-voice-mcp",
+  "version": "0.1.2",
+  "description": "Turn-based voice MCP server for Claude Code and Codex",
   "main": "bin/claude-voice.js",
   "bin": {
-    "claude-voice": "bin/claude-voice.js"
+    "agent-voice-mcp": "bin/claude-voice.js"
   },
   "scripts": {},
   "keywords": [
@@ -20,11 +20,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tuansondinh/claude-voice.git"
+    "url": "https://github.com/tuansondinh/agent-voice-mcp.git"
   },
-  "homepage": "https://github.com/tuansondinh/claude-voice",
+  "homepage": "https://github.com/tuansondinh/agent-voice-mcp",
   "bugs": {
-    "url": "https://github.com/tuansondinh/claude-voice/issues"
+    "url": "https://github.com/tuansondinh/agent-voice-mcp/issues"
   },
   "engines": {
     "node": ">=18"

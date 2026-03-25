@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "claude-voice"
-version = "0.1.1"
-description = "Voice MCP server for Claude Code — hands-free voice input/output via TTS + Whisper"
+name = "agent-voice-mcp"
+version = "0.1.2"
+description = "Turn-based voice MCP server for Claude Code and Codex"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
@@ -33,9 +33,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tuansondinh/claude-voice"
-Repository = "https://github.com/tuansondinh/claude-voice"
-Issues = "https://github.com/tuansondinh/claude-voice/issues"
+Homepage = "https://github.com/tuansondinh/agent-voice-mcp"
+Repository = "https://github.com/tuansondinh/agent-voice-mcp"
+Issues = "https://github.com/tuansondinh/agent-voice-mcp/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -45,7 +45,7 @@ macos = ["pyobjc-framework-AVFoundation>=10.0"]
 wakeword = []
 
 [project.scripts]
-claude-voice = "lazy_claude.__main__:main"
+agent-voice-mcp = "lazy_claude.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["lazy_claude"]

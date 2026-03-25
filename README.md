@@ -1,6 +1,28 @@
-# claude-voice: Voice MCP Server
+# agent-voice-mcp: Voice MCP Server
 
 A Model Context Protocol (MCP) server that provides voice input/output integration for MCP clients such as Claude Code and Codex, enabling hands-free interaction and voice-driven workflows on macOS.
+
+Talk to Claude Code or Codex by voice.
+
+Typical flow:
+
+```text
+You: Enable voice mode
+
+Claude: Now in voice mode. What would you like to do?
+
+You: Open the auth flow and fix the login bug OVER
+
+Claude: I’ll inspect the auth flow and the login path now. Anything else?
+
+You: No, continue OVER
+```
+
+How it works:
+- Claude asks questions aloud
+- you answer by voice
+- OPTIONAL: say `OVER` when you want your reply submitted right away, otherwise wait 3 seconds.
+- if you pause briefly, Claude can still wait for continuation before finalizing the turn
 
 ## Quick Install
 
@@ -11,7 +33,7 @@ brew install espeak-ng ffmpeg
 
 ### 2. Register the MCP server in Claude Code
 ```bash
-claude mcp add claude-voice npx @tuan_son.dinh/claude-voice
+claude mcp add agent-voice-mcp npx @tuan_son.dinh/agent-voice-mcp
 ```
 
 This is the main install path. No repo clone is required.
@@ -19,9 +41,9 @@ This is the main install path. No repo clone is required.
 Or add manually to `~/.claude.json` under `mcpServers`:
 ```json
 {
-  "claude-voice": {
+  "agent-voice-mcp": {
     "command": "npx",
-    "args": ["@tuan_son.dinh/claude-voice"]
+    "args": ["@tuan_son.dinh/agent-voice-mcp"]
   }
 }
 ```
@@ -42,20 +64,20 @@ If you want the same experience, add a section like this to your global `CLAUDE.
 
 ```markdown
 ## Voice I/O
-- `claude-voice` MCP provides voice input/output integration for hands-free workflows
-- Tool: `mcp__claude-voice__ask_user_voice` speaks questions aloud and records voice replies
-- Tool: `mcp__claude-voice__speak_message` speaks short confirmations or updates
+- `agent-voice-mcp` MCP provides voice input/output integration for hands-free workflows
+- Tool: `mcp__agent-voice-mcp__ask_user_voice` speaks questions aloud and records voice replies
+- Tool: `mcp__agent-voice-mcp__speak_message` speaks short confirmations or updates
 
 ### Voice Mode Toggle
 - Voice mode is OFF by default
 - Voice mode is activated when your preferred trigger fires, for example a keybinding or explicit user request
-- On activation, call `mcp__claude-voice__ask_user_voice` with: "Now in voice mode. What would you like to do?"
+- On activation, call `mcp__agent-voice-mcp__ask_user_voice` with: "Now in voice mode. What would you like to do?"
 - Stay in voice mode for the rest of the conversation until the user explicitly exits it
 
 ### Voice Mode Rules
 - While in voice mode, never ask for typed replies
-- Use `mcp__claude-voice__ask_user_voice` for all follow-up questions
-- Use `mcp__claude-voice__speak_message` for short spoken confirmations when useful
+- Use `mcp__agent-voice-mcp__ask_user_voice` for all follow-up questions
+- Use `mcp__agent-voice-mcp__speak_message` for short spoken confirmations when useful
 - Exit voice mode only when the user says something like "exit voice mode", "stop voice mode", or "back to text"
 - Do not leave voice mode because of errors or tool failures; keep interacting by voice unless the user explicitly switches back to text
 ```
@@ -100,15 +122,56 @@ If your prompt setup mirrors the example in this README, exit by saying somethin
 - `stop voice mode`
 - `back to text`
 
+### How Voice Replies Are Submitted
+
+Users should be told explicitly how reply submission works.
+
+The important rule is:
+
+```text
+Say OVER to submit your response.
+```
+
+More precisely, the current behavior is:
+- the listener closes one spoken segment after about `500ms` of silence
+- after that, the server waits up to `3 seconds` for more speech
+- if the last spoken segment ends with `OVER`, the response is submitted immediately after that segment closes
+- `OVER` is removed from the final transcript and is treated as a submit keyword, not part of the answer
+
+Practical examples:
+
+```text
+"Please update the login page OVER"
+```
+
+This submits the reply as soon as the segment closes.
+
+```text
+"Please update the login page"
+```
+
+This does not submit immediately. The server will still wait briefly for continuation before finalizing the reply.
+
+```text
+"Please update the login page ... and also fix the header OVER"
+```
+
+This can span multiple spoken segments. The reply is finalized when the final segment ends with `OVER`.
+
+Recommended wording for users:
+- say your answer normally
+- end with `OVER` when you want Claude to submit it
+- if you do not say `OVER`, Claude may wait for a short continuation window before treating the response as finished
+
 ### Other MCP Clients
 
 Any stdio MCP client can run this server. For local development, the generic command is:
 
 ```json
 {
-  "claude-voice": {
+  "agent-voice-mcp": {
     "command": "uv",
-    "args": ["--directory", "/absolute/path/to/claude-voice", "run", "python", "-m", "lazy_claude"]
+    "args": ["--directory", "/absolute/path/to/agent-voice-mcp", "run", "python", "-m", "lazy_claude"]
   }
 }
 ```
@@ -123,7 +186,7 @@ Use your MCP client's normal server-registration flow and substitute the correct
 - **Text-to-Speech**: Convert text responses to spoken audio with natural-sounding output
 - **Real-Time Recording**: Stream audio input with automatic silence detection and submission
 - **Fast Model Loading**: Efficient ML model management for speech recognition and synthesis
-- **Fully Integrated**: Registered as `claude-voice` MCP server in Claude Code
+- **Fully Integrated**: Registered as `agent-voice-mcp` MCP server in Claude Code
 
 ## Prerequisites
 
@@ -160,7 +223,7 @@ uv sync --all-extras
 
 ### 1. Clone or Navigate to Project
 ```bash
-cd /Users/sonwork/Workspace/claude-voice
+cd /Users/sonwork/Workspace/agent-voice-mcp
 ```
 
 ### 2. Install System Dependencies
@@ -183,9 +246,9 @@ pip install -e .
 The server can be registered in `~/.claude.json`:
 ```json
 {
-  "claude-voice": {
+  "agent-voice-mcp": {
     "command": "uv",
-    "args": ["--directory", "/Users/sonwork/Workspace/claude-voice", "run", "python", "-m", "lazy_claude"]
+    "args": ["--directory", "/Users/sonwork/Workspace/agent-voice-mcp", "run", "python", "-m", "lazy_claude"]
   }
 }
 ```
@@ -198,9 +261,9 @@ Register the same stdio command in your client's MCP config:
 
 ```json
 {
-  "claude-voice": {
+  "agent-voice-mcp": {
     "command": "uv",
-    "args": ["--directory", "/absolute/path/to/claude-voice", "run", "python", "-m", "lazy_claude"]
+    "args": ["--directory", "/absolute/path/to/agent-voice-mcp", "run", "python", "-m", "lazy_claude"]
   }
 }
 ```
@@ -210,27 +273,9 @@ No `CLAUDE.md` update is required. If your client supports project instructions,
 ## Usage
 
 ### Starting the Server
-The server runs automatically when Claude Code loads the `claude-voice` MCP. No manual startup needed.
+The server runs automatically when Claude Code loads the `agent-voice-mcp` MCP. No manual startup needed.
 
 ### Available Tools
-
-### Wake Word Setup
-
-Wake-word mode now uses `openWakeWord`, so no Picovoice account or access key is needed.
-
-Install it in the active environment:
-```bash
-pip install openwakeword
-```
-
-Optional environment variables:
-```bash
-export OPENWAKEWORD_MODEL_PATH=/absolute/path/to/model.onnx
-export OPENWAKEWORD_THRESHOLD=0.5
-export OPENWAKEWORD_VAD_THRESHOLD=0.5
-```
-
-If `OPENWAKEWORD_MODEL_PATH` is unset, `openWakeWord` will use its default bundled/pretrained model configuration.
 
 #### `ask_user_voice(questions: list[str]) → str`
 Reads questions aloud and records voice replies with automatic submission.
@@ -296,8 +341,8 @@ Use the ask_user_voice tool to get the user's voice input on whether to proceed 
 1. **Ask Single Questions**: Use clear, concise questions (one per call)
 2. **Batch When Appropriate**: Group related questions in a single call to reduce back-and-forth
 3. **Mic Is Turn-Based**: Voice capture is activated only during `ask_user_voice(...)`, not as an always-listening input mode
-4. **Handle Pauses**: The listener segments after about `1.0s` of silence, but the server keeps the reply open for up to `5s` waiting for continuation
-5. **Use `OVER` To Submit**: Ending a segment with `OVER` followed by the normal `1.5s` pause submits immediately and removes `OVER` from the returned transcript
+4. **Handle Pauses**: The listener segments after about `500ms` of silence, but the server keeps the reply open for up to `3s` waiting for continuation
+5. **Use `OVER` To Submit**: Ending a segment with `OVER` followed by the normal `500ms` segment-close pause submits immediately and removes `OVER` from the returned transcript
 6. **Provide Context**: Speak response confirmations back using `speak_message` for feedback loops
 
 ## Architecture
@@ -419,7 +464,7 @@ uv run python -m lazy_claude
 
 ### Project Structure
 ```
-claude-voice/
+agent-voice-mcp/
 ├── lazy_claude/
 │   ├── __main__.py              # Entry point
 │   ├── server.py                # MCP server, path detection, tool definitions
@@ -456,7 +501,7 @@ claude-voice/
 
 ## License
 
-Part of the claude-voice project. See LICENSE for details.
+Part of the agent-voice-mcp project. See LICENSE for details.
 
 ## Support
 
