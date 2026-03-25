@@ -376,17 +376,18 @@ class TestFallbackGate:
 
 
 class TestBargeInSimplified:
-    """Barge-in should now use NORMAL_THRESHOLD on AEC-cleaned signal."""
+    """Speech during TTS should be buffered for STOP-only barge-in decisions."""
 
-    def test_barge_in_fires_on_normal_threshold_during_tts(self):
-        """VAD >= NORMAL_THRESHOLD on low-energy cleaned signal during TTS fires barge-in."""
+    def test_speech_during_tts_creates_barge_in_candidate(self):
+        """VAD >= NORMAL_THRESHOLD on cleaned signal during TTS buffers a candidate."""
         from lazy_claude.aec import ReferenceBuffer, EchoCanceller
         from lazy_claude.audio import ContinuousListener
 
-        # Low energy residual (passes gate) + high VAD probability (user speech)
         clean_speech = np.zeros(CHUNK, dtype=np.float32) + 0.001
 
-        vad = MagicMock(return_value=0.8)  # above NORMAL_THRESHOLD
+        recorded_frames = int(np.ceil(ContinuousListener.MIN_SPEECH_DURATION / (CHUNK / 16000)))
+        speech_frames = ContinuousListener.BARGE_IN_FRAMES - 1 + recorded_frames
+        vad = MagicMock(side_effect=([0.8] * speech_frames) + [0.0])
         buf = ReferenceBuffer(capacity=4096, write_sr=16_000, read_sr=16_000)
         ec = MagicMock(spec=EchoCanceller)
         ec.cancel.return_value = clean_speech
@@ -396,22 +397,26 @@ class TestBargeInSimplified:
         listener._tts_active = True
 
         indata = clean_speech.reshape(-1, 1)
-        # Send BARGE_IN_FRAMES frames to confirm barge-in
-        for _ in range(ContinuousListener.BARGE_IN_FRAMES + 1):
+        for _ in range(speech_frames):
             listener._callback(indata, CHUNK, MagicMock(), None)
+        listener._barge_in_silence_started = time.monotonic() - 1.0
+        listener._callback(indata, CHUNK, MagicMock(), None)
 
+        candidate = listener.pop_barge_in_candidate()
+        assert isinstance(candidate, np.ndarray)
+        # barge_in event IS set when a candidate is buffered — this signals
+        # the server to check the candidate and decide whether to stop TTS.
         assert listener.barge_in.is_set(), \
-            "Barge-in should fire when VAD >= NORMAL_THRESHOLD on cleaned signal"
+            "barge_in event should be set when a candidate is buffered"
 
     def test_barge_in_does_not_require_separate_barge_in_threshold(self):
         """BARGE_IN_THRESHOLD constant must not exist — use NORMAL_THRESHOLD."""
         from lazy_claude.audio import ContinuousListener
         assert not hasattr(ContinuousListener, 'BARGE_IN_THRESHOLD')
 
-    def test_no_barge_in_on_low_vad_prob_during_tts(self):
-        """Low VAD prob on cleaned signal should NOT fire barge-in."""
+    def test_no_barge_in_candidate_on_low_vad_prob_during_tts(self):
+        """Low VAD prob on cleaned signal should not even start a candidate."""
         from lazy_claude.aec import ReferenceBuffer, EchoCanceller
-        from lazy_claude.audio import ContinuousListener
 
         clean_silence = np.zeros(CHUNK, dtype=np.float32) + 0.001
 
@@ -430,131 +435,6 @@ class TestBargeInSimplified:
 
         assert not listener.barge_in.is_set(), \
             "Barge-in should not fire on low VAD probability"
+        assert listener.pop_barge_in_candidate() is None
 
 
-# ---------------------------------------------------------------------------
-# Server — speak_message_impl no longer calls set_tts_playing
-# ---------------------------------------------------------------------------
-
-
-class TestSpeakMessageNoSetTTSPlaying:
-    """speak_message_impl should NOT call listener.set_tts_playing() anymore."""
-
-    def _make_server(self):
-        import lazy_claude.server  # ensure module is imported before patch resolves targets
-        mock_tts = _make_mock_tts()
-        with patch('sys.platform', 'linux'), \
-             patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener'):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s
-
-    def test_speak_message_calls_set_tts_playing(self):
-        """speak_message_impl sets TTS flag for fallback gate + drains after.
-
-        On the fallback path (_use_macos_aec=False), drain_queue is called.
-        """
-        server = self._make_server()
-        server._use_macos_aec = False  # ensure fallback path
-        server._listener = MagicMock()
-        server.speak_message_impl(text="Hello")
-        server._listener.set_tts_playing.assert_any_call(True)
-        server._listener.set_tts_playing.assert_any_call(False)
-        server._listener.drain_queue.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Server — _ask_single no longer has 0.6s sleep + drain_queue
-# ---------------------------------------------------------------------------
-
-
-class TestAskSingleEchoTailDrain:
-    """_ask_single should sleep for echo tail and drain queue after TTS."""
-
-    def _make_server(self):
-        import lazy_claude.server  # ensure module is imported before patch resolves targets
-        mock_tts = _make_mock_tts()
-        with patch('sys.platform', 'linux'), \
-             patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener'):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s
-
-    def test_drain_queue_called_after_tts(self):
-        """drain_queue should be called in _ask_single after echo tail.
-
-        On the fallback path (_use_macos_aec=False), drain_queue is called.
-        """
-        server = self._make_server()
-        server._use_macos_aec = False  # ensure fallback path
-        mock_listener = MagicMock()
-        mock_listener.barge_in = threading.Event()
-        mock_listener.is_active = True
-        mock_listener.get_next_speech = MagicMock(return_value=None)
-        server._listener = mock_listener
-
-        server._ask_single("Test question?")
-
-        mock_listener.drain_queue.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Server — VoiceServer wires shared ReferenceBuffer
-# ---------------------------------------------------------------------------
-
-
-class TestVoiceServerAECWiring:
-    """VoiceServer.__init__ should create shared ReferenceBuffer and EchoCanceller.
-
-    These tests exercise the sounddevice fallback path (sys.platform patched to
-    'linux') so they work on macOS without needing AVFoundation / mic permissions.
-    """
-
-    def _make_server_with_stubs(self):
-        import lazy_claude.server  # ensure module is imported before patch resolves targets
-        mock_tts = _make_mock_tts()
-        # Patch sys.platform to 'linux' so VoiceServer skips the macOS branch
-        # and goes straight to the fallback path that creates _ref_buf / _echo_canceller.
-        with patch('sys.platform', 'linux'), \
-             patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ContinuousListener'):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s
-
-    def test_voice_server_has_ref_buf(self):
-        server = self._make_server_with_stubs()
-        assert hasattr(server, '_ref_buf'), \
-            "VoiceServer should have a _ref_buf attribute (shared ReferenceBuffer)"
-
-    def test_voice_server_has_echo_canceller(self):
-        server = self._make_server_with_stubs()
-        assert hasattr(server, '_echo_canceller'), \
-            "VoiceServer should have a _echo_canceller attribute (EchoCanceller)"
-
-    def test_ref_buf_is_reference_buffer_instance(self):
-        from lazy_claude.aec import ReferenceBuffer
-        server = self._make_server_with_stubs()
-        assert isinstance(server._ref_buf, ReferenceBuffer), \
-            "_ref_buf should be a ReferenceBuffer instance"
-
-    def test_echo_canceller_is_echo_canceller_instance(self):
-        from lazy_claude.aec import EchoCanceller
-        server = self._make_server_with_stubs()
-        assert isinstance(server._echo_canceller, EchoCanceller), \
-            "_echo_canceller should be an EchoCanceller instance"

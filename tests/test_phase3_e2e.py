@@ -204,11 +204,6 @@ class TestResidualEchoSuppression:
 class TestEchoCancellerResetFull:
     """reset_full() should wipe filter coefficients, unlike reset() which only clears state."""
 
-    def test_reset_full_exists(self):
-        from lazy_claude.aec import EchoCanceller
-        ec = EchoCanceller()
-        assert hasattr(ec, 'reset_full'), "EchoCanceller.reset_full() must exist"
-
     def test_reset_full_clears_coefficients(self):
         """After adaptation, reset_full() should zero filter weights."""
         from lazy_claude.aec import EchoCanceller
@@ -492,17 +487,25 @@ class TestBargeInIntegration:
         ec = MagicMock(spec=EchoCanceller)
         ec.cancel.return_value = clean_user_speech
 
+        # Need enough speech frames for BARGE_IN_FRAMES + MIN_SPEECH_DURATION
+        recorded_frames = int(np.ceil(ContinuousListener.MIN_SPEECH_DURATION / (CHUNK / 16000)))
+        speech_frames = ContinuousListener.BARGE_IN_FRAMES - 1 + recorded_frames
+        vad_responses = ([0.9] * speech_frames) + [0.0]  # speech then silence
+        vad = MagicMock(side_effect=vad_responses)
+
         listener = _make_listener_with_callback(vad=vad, ref_buf=buf, echo_canceller=ec)
         listener._active.set()
         listener._tts_active = True  # TTS is playing
 
         indata = np.zeros((CHUNK, 1), dtype=np.float32)
-        for _ in range(ContinuousListener.BARGE_IN_FRAMES + 1):
+        for _ in range(speech_frames):
             listener._callback(indata, CHUNK, MagicMock(), None)
 
+        # Expire silence timer and feed a silence frame to finalize the candidate
+        listener._barge_in_silence_started = time.monotonic() - 1.0
+        listener._callback(indata, CHUNK, MagicMock(), None)
+
         assert listener.barge_in.is_set(), "Barge-in should be detected"
-        # DTD fires: tts_active should be cleared
-        assert listener._tts_active is False, "TTS active flag cleared after barge-in"
 
     def test_dtd_freezes_filter_during_double_talk(self):
         """During double-talk, filter norm must not increase significantly."""

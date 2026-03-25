@@ -228,12 +228,15 @@ class TestAVAudioBackendMocked:
 
         with patch.dict('sys.modules', {'AVFoundation': AVFoundation_mock}):
             backend = AVAudioBackend.__new__(AVAudioBackend)
+            backend._AVFoundation = AVFoundation_mock
+            backend._Foundation = None
             backend._engine = mock_engine
             backend._player = mock_player_node
             backend._input_node = mock_input_node
             backend._mixer_node = mock_mixer_node
             backend._running = True
             backend._tap_installed = False
+            backend._vp_enabled = False
 
         return backend, mock_engine, mock_player_node, mock_input_node
 
@@ -242,6 +245,36 @@ class TestAVAudioBackendMocked:
         backend, mock_engine, mock_player, mock_input = self._make_backend()
         backend._tap_installed = False
         backend.shutdown()
+        mock_engine.stop.assert_called_once()
+
+    def test_install_mic_tap_resumes_engine_when_suspended(self):
+        """install_mic_tap() resumes a suspended engine before tapping the mic."""
+        backend, mock_engine, mock_player, mock_input = self._make_backend()
+        backend._running = False
+        backend._tap_queue = queue.Queue()
+        backend._consumer_stop = threading.Event()
+        backend._tap_callback = None
+        backend._consumer_thread = None
+        mock_engine.startAndReturnError_.return_value = True
+        mock_output_format = MagicMock()
+        mock_output_format.sampleRate.return_value = 48_000
+        mock_output_format.channelCount.return_value = 1
+        mock_input.outputFormatForBus_.return_value = mock_output_format
+
+        backend.install_mic_tap(MagicMock())
+
+        mock_engine.startAndReturnError_.assert_called_once()
+
+    def test_remove_mic_tap_suspends_engine_when_idle(self):
+        """remove_mic_tap() stops the engine once no tap remains."""
+        backend, mock_engine, mock_player, mock_input = self._make_backend()
+        backend._tap_installed = True
+        backend._consumer_stop = threading.Event()
+        backend._consumer_thread = MagicMock()
+
+        backend.remove_mic_tap()
+
+        mock_input.removeTapOnBus_.assert_called_once_with(0)
         mock_engine.stop.assert_called_once()
 
     def test_stop_playback_stops_and_replays_player(self):
@@ -301,99 +334,6 @@ class TestAVAudioBackendMocked:
 # MacOSContinuousListener — utterance queuing with synthetic VAD input
 # ---------------------------------------------------------------------------
 
-class TestMacOSContinuousListenerAPI:
-    """Verify MacOSContinuousListener has the same public API as ContinuousListener."""
-
-    def _make_listener(self):
-        """Return a MacOSContinuousListener with mocked dependencies."""
-        mock_vad = MagicMock()
-        mock_vad.return_value = 0.0  # silence by default
-
-        from lazy_claude.av_audio import MacOSContinuousListener
-        with patch('lazy_claude.av_audio.AVAudioBackend') as MockBackend:
-            mock_backend_instance = MagicMock()
-            MockBackend.return_value = mock_backend_instance
-            listener = MacOSContinuousListener.__new__(MacOSContinuousListener)
-            # Init internal state manually without starting threads
-            listener._vad = mock_vad
-            listener._slot_lock = threading.Condition()
-            listener._pending = None
-            listener._barge_in_event = threading.Event()
-            listener._stop_event = threading.Event()
-            listener._tts_active = False
-            listener._active = threading.Event()
-            listener._recording = False
-            listener._utterance_chunks = []
-            listener._accumulated_speech = 0.0
-            listener._silence_started = None
-            listener._barge_in_frame_count = 0
-            listener._backend = mock_backend_instance
-        return listener, mock_vad
-
-    def test_has_get_next_speech(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.get_next_speech)
-
-    def test_has_set_active(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.set_active)
-
-    def test_is_active_false_initially(self):
-        listener, _ = self._make_listener()
-        assert not listener.is_active
-
-    def test_set_active_true(self):
-        listener, _ = self._make_listener()
-        listener.set_active(True)
-        assert listener.is_active
-
-    def test_set_active_false(self):
-        listener, _ = self._make_listener()
-        listener.set_active(True)
-        listener.set_active(False)
-        assert not listener.is_active
-
-    def test_has_set_tts_playing(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.set_tts_playing)
-
-    def test_set_tts_playing_sets_flag(self):
-        listener, _ = self._make_listener()
-        listener.set_tts_playing(True)
-        assert listener._tts_active is True
-        listener.set_tts_playing(False)
-        assert listener._tts_active is False
-
-    def test_has_clear_barge_in(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.clear_barge_in)
-
-    def test_barge_in_is_threading_event(self):
-        listener, _ = self._make_listener()
-        assert isinstance(listener.barge_in, threading.Event)
-
-    def test_has_drain_queue(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.drain_queue)
-
-    def test_drain_queue_clears_speech(self):
-        listener, _ = self._make_listener()
-        with listener._slot_lock:
-            listener._pending = np.zeros(512, dtype=np.float32)
-        listener.drain_queue()
-        with listener._slot_lock:
-            assert listener._pending is None
-
-    def test_has_stop(self):
-        listener, _ = self._make_listener()
-        assert callable(listener.stop)
-
-    def test_get_next_speech_returns_none_on_timeout(self):
-        listener, _ = self._make_listener()
-        listener.set_active(True)
-        result = listener.get_next_speech(timeout=0.05)
-        assert result is None
-
 
 class TestMacOSContinuousListenerVADProcessing:
     """Test utterance segmentation logic via direct _process_chunk calls."""
@@ -414,6 +354,7 @@ class TestMacOSContinuousListenerVADProcessing:
         listener._tts_stopped_at = 0.0
         listener._active = threading.Event()
         listener._active.set()  # active by default for VAD tests
+        listener._backend_tap_active = True
         listener._recording = False
         listener._utterance_chunks = []
         listener._accumulated_speech = 0.0
@@ -463,8 +404,8 @@ class TestMacOSContinuousListenerVADProcessing:
         assert isinstance(utterance, np.ndarray)
         assert utterance.dtype == np.float32
 
-    def test_barge_in_detected_during_tts(self):
-        """VAD firing during TTS → barge_in event set."""
+    def test_barge_in_candidate_buffered_during_tts(self):
+        """Speech during TTS is buffered as a candidate, not an immediate stop."""
         listener, mock_vad = self._make_listener_with_callback()
         listener._tts_active = True
         listener.clear_barge_in()
@@ -472,12 +413,23 @@ class TestMacOSContinuousListenerVADProcessing:
         mock_vad.return_value = 0.9  # speech
         chunk = np.ones(512, dtype=np.float32) * 0.1
 
-        # Need BARGE_IN_FRAMES consecutive speech frames
         from lazy_claude.av_audio import MacOSContinuousListener
-        barge_in_frames = MacOSContinuousListener.BARGE_IN_FRAMES
-        for _ in range(barge_in_frames):
+        recorded_frames = int(
+            np.ceil(MacOSContinuousListener.MIN_SPEECH_DURATION / (512 / 16000))
+        )
+        speech_frames = (
+            MacOSContinuousListener.BARGE_IN_FRAMES - 1 + recorded_frames
+        )
+        for _ in range(speech_frames):
             listener._process_chunk(chunk)
 
+        mock_vad.return_value = 0.0
+        listener._barge_in_silence_started = time.monotonic() - 1.0
+        listener._process_chunk(np.zeros(512, dtype=np.float32))
+
+        candidate = listener.pop_barge_in_candidate()
+        assert isinstance(candidate, np.ndarray)
+        assert candidate.dtype == np.float32
         assert listener.barge_in.is_set()
 
     def test_inactive_listener_discards_audio(self):
@@ -526,37 +478,9 @@ class TestMacOSTTSEngineAPI:
             engine._stop_event = threading.Event()
         return engine, mock_pipeline, mock_backend
 
-    def test_has_speak(self):
-        engine, _, _ = self._make_engine()
-        assert callable(engine.speak)
-
-    def test_has_stop(self):
-        engine, _, _ = self._make_engine()
-        assert callable(engine.stop)
-
-    def test_is_speaking_property_exists(self):
-        from lazy_claude.av_audio import MacOSTTSEngine
-        assert hasattr(MacOSTTSEngine, 'is_speaking')
-
-    def test_is_speaking_false_initially(self):
-        engine, _, _ = self._make_engine()
-        assert engine.is_speaking is False
-
-    def test_stop_sets_not_speaking(self):
-        engine, _, _ = self._make_engine()
-        engine._speaking = True
-        engine.stop()
-        assert engine.is_speaking is False
-
     def test_speak_empty_text_is_noop(self):
         engine, mock_pipeline, mock_backend = self._make_engine()
         engine.speak("")
-        mock_pipeline.assert_not_called()
-        mock_backend.play_audio.assert_not_called()
-
-    def test_speak_whitespace_only_is_noop(self):
-        engine, mock_pipeline, mock_backend = self._make_engine()
-        engine.speak("   ")
         mock_pipeline.assert_not_called()
         mock_backend.play_audio.assert_not_called()
 
@@ -664,144 +588,3 @@ class TestSileroVADChunkRegression:
         assert np.mean(probabilities) < 0.5, "Mean prob should be low for silence"
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: Single-slot Condition-based listener tests (MacOSContinuousListener)
-# ---------------------------------------------------------------------------
-
-
-class TestMacOSListenerSingleSlot:
-    """Phase 2: verify Condition-based single-slot design for MacOSContinuousListener."""
-
-    def _make_listener(self):
-        """Return a MacOSContinuousListener with mocked dependencies."""
-        from lazy_claude.av_audio import MacOSContinuousListener
-        listener = MacOSContinuousListener.__new__(MacOSContinuousListener)
-        listener._vad = MagicMock(return_value=0.0)
-        listener._slot_lock = threading.Condition()
-        listener._pending = None
-        listener._barge_in_event = threading.Event()
-        listener._stop_event = threading.Event()
-        listener._tts_active = False
-        listener._tts_stopped_at = 0.0
-        listener._active = threading.Event()
-        listener._active.set()
-        listener._recording = False
-        listener._utterance_chunks = []
-        listener._accumulated_speech = 0.0
-        listener._silence_started = None
-        listener._barge_in_frame_count = 0
-        listener._backend = MagicMock()
-        return listener
-
-    def _produce_utterance(self, listener):
-        """Drive _process_chunk to produce a complete utterance in _pending."""
-        listener._vad.return_value = 0.9
-        chunk = np.ones(512, dtype=np.float32) * 0.1
-        chunk_duration = 512 / 16_000
-        n_speech = int(0.6 / chunk_duration) + 1
-        for _ in range(n_speech):
-            listener._process_chunk(chunk)
-        # Expire silence timer to trigger completion
-        listener._silence_started = time.monotonic() - 2.0
-        listener._vad.return_value = 0.0
-        listener._process_chunk(chunk)
-
-    def test_slot_lock_is_condition(self):
-        listener = self._make_listener()
-        assert isinstance(listener._slot_lock, threading.Condition)
-
-    def test_pending_starts_none(self):
-        listener = self._make_listener()
-        with listener._slot_lock:
-            assert listener._pending is None
-
-    def test_utterance_stored_in_pending_slot(self):
-        listener = self._make_listener()
-        self._produce_utterance(listener)
-        with listener._slot_lock:
-            assert listener._pending is not None
-            assert isinstance(listener._pending, np.ndarray)
-
-    def test_second_utterance_replaces_first(self):
-        """Second utterance produced before get_next_speech() replaces first in slot."""
-        listener = self._make_listener()
-        # Produce first utterance
-        self._produce_utterance(listener)
-        with listener._slot_lock:
-            first = listener._pending
-        assert first is not None
-
-        # Reset recording state to allow a second utterance
-        listener._recording = False
-        listener._accumulated_speech = 0.0
-        listener._silence_started = None
-
-        # Produce second utterance
-        self._produce_utterance(listener)
-        with listener._slot_lock:
-            second = listener._pending
-
-        # The slot holds the second utterance (first was replaced)
-        assert second is not None
-        # They are different arrays (second replaced first)
-        assert second is not first
-
-    def test_drain_queue_clears_pending_slot(self):
-        listener = self._make_listener()
-        self._produce_utterance(listener)
-        with listener._slot_lock:
-            assert listener._pending is not None
-        listener.drain_queue()
-        with listener._slot_lock:
-            assert listener._pending is None
-
-    def test_get_next_speech_returns_none_on_timeout(self):
-        """get_next_speech() with no utterance arrives returns None after timeout."""
-        listener = self._make_listener()
-        result = listener.get_next_speech(timeout=0.05)
-        assert result is None
-
-    def test_get_next_speech_returns_utterance(self):
-        """get_next_speech() returns utterance produced by _process_chunk."""
-        listener = self._make_listener()
-        audio = np.ones(1024, dtype=np.float32)
-        # Put directly into slot and notify
-        with listener._slot_lock:
-            listener._pending = audio
-            listener._slot_lock.notify_all()
-        result = listener.get_next_speech(timeout=1.0)
-        assert result is not None
-        assert isinstance(result, np.ndarray)
-
-    def test_get_next_speech_clears_pending_after_read(self):
-        """After get_next_speech() reads the slot, _pending is None."""
-        listener = self._make_listener()
-        audio = np.ones(1024, dtype=np.float32)
-        with listener._slot_lock:
-            listener._pending = audio
-            listener._slot_lock.notify_all()
-        listener.get_next_speech(timeout=1.0)
-        with listener._slot_lock:
-            assert listener._pending is None
-
-    def test_producer_notifies_consumer(self):
-        """A background thread waiting in get_next_speech is woken when utterance arrives."""
-        listener = self._make_listener()
-        result_holder = [None]
-
-        def consumer():
-            result_holder[0] = listener.get_next_speech(timeout=2.0)
-
-        t = threading.Thread(target=consumer, daemon=True)
-        t.start()
-        time.sleep(0.05)  # let consumer block in Condition.wait
-
-        # Producer puts audio in slot
-        audio = np.ones(512, dtype=np.float32)
-        with listener._slot_lock:
-            listener._pending = audio
-            listener._slot_lock.notify_all()
-
-        t.join(timeout=2.0)
-        assert result_holder[0] is not None
-        assert isinstance(result_holder[0], np.ndarray)

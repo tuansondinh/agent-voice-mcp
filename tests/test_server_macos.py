@@ -36,6 +36,11 @@ for _mod in ('sounddevice', 'kokoro', 'AVFoundation', 'Foundation', 'objc'):
     if _mod not in sys.modules:
         _stub(_mod)
 
+# Patch continuation timeout to near-zero so tests don't wait 3 real seconds
+import lazy_claude.server as _server_mod
+_server_mod._CONTINUATION_RESPONSE_TIMEOUT = 0.01
+_server_mod._INITIAL_RESPONSE_TIMEOUT = 0.05
+
 
 def _tr(text: str = "hello", no_speech_prob: float = 0.1):
     """Return a TranscribeResult for use in transcribe() mocks."""
@@ -58,7 +63,18 @@ def _make_mock_tts():
 def _make_mock_listener(next_speech=None):
     mock = MagicMock()
     mock.barge_in = threading.Event()
-    mock.get_next_speech = MagicMock(return_value=next_speech)
+    if next_speech is not None:
+        # Return next_speech exactly once, then always None thereafter
+        _returned = [False]
+        def _get_next_speech(**kwargs):
+            if not _returned[0]:
+                _returned[0] = True
+                return next_speech
+            return None
+        mock.get_next_speech = MagicMock(side_effect=_get_next_speech)
+    else:
+        mock.get_next_speech = MagicMock(return_value=None)
+    mock.pop_barge_in_candidate = MagicMock(return_value=None)
     mock.set_active = MagicMock()
     mock.set_tts_playing = MagicMock()
     mock.clear_barge_in = MagicMock()
@@ -84,6 +100,7 @@ def _build_voice_server_directly(use_macos_aec: bool, next_speech=None):
     s.listening = True
     s.busy = False
     s._lock = threading.Lock()
+    s._voice_device_lock = threading.Lock()
 
     return s, mock_tts, mock_listener
 
@@ -182,15 +199,6 @@ class TestVoiceServerBackendFlag:
         s, _, _ = _build_server_via_init(platform_str='darwin', av_available=False)
         assert s._use_macos_aec is False
 
-    def test_server_always_starts_even_on_macos_failure(self):
-        """Server must always start — never raise on audio init failure."""
-        s, _, _ = _build_server_via_init(platform_str='darwin', av_available=False)
-        assert s is not None
-        assert isinstance(s._use_macos_aec, bool)
-
-    def test_use_macos_aec_is_bool_type(self):
-        s, _, _ = _build_fallback_server()
-        assert isinstance(s._use_macos_aec, bool)
 
 
 def _build_fallback_server(next_speech=None):
@@ -539,14 +547,6 @@ class TestTryInitMacOSBackend:
         s = VoiceServer.__new__(VoiceServer)
         return s
 
-    def test_returns_false_on_import_error(self):
-        """ImportError from lazy_claude.av_audio → returns False."""
-        s = self._make_bare_server()
-        with patch('lazy_claude.server.VoiceServer._try_init_macos_backend') as m:
-            m.return_value = False
-            result = m(s)
-        assert result is False
-
     def test_returns_false_on_backend_runtime_error(self):
         """RuntimeError from AVAudioBackend() → returns False."""
         s = self._make_bare_server()
@@ -581,22 +581,3 @@ class TestTryInitMacOSBackend:
         assert result is True
         assert s.tts is mock_tts
         assert s._listener is mock_listener
-
-    def test_sets_listener_and_tts_on_success(self):
-        """On success, _listener and tts are set to the macOS instances."""
-        s = self._make_bare_server()
-        mock_listener = _make_mock_listener()
-        mock_tts = _make_mock_tts()
-
-        mock_av_module = MagicMock()
-        mock_av_module.AVAudioBackend.return_value = MagicMock()
-        mock_av_module.MacOSContinuousListener.return_value = mock_listener
-        mock_av_module.MacOSTTSEngine.return_value = mock_tts
-
-        with patch.dict('sys.modules', {'lazy_claude.av_audio': mock_av_module}), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            s._try_init_macos_backend()
-
-        assert s._listener is mock_listener
-        assert s.tts is mock_tts

@@ -216,8 +216,10 @@ class AVAudioBackend:
         self._consumer_stop = threading.Event()
         self._tap_callback: Optional[Callable[[np.ndarray], None]] = None
         self._actual_capture_rate: int = 48_000  # updated when tap is installed
+        self._vp_enabled: bool = False  # track voice processing state
 
         self._setup_engine()
+        self._suspend_engine_if_idle()
 
     def _setup_engine(self) -> None:
         """Build and start the AVAudioEngine."""
@@ -247,19 +249,11 @@ class AVAudioBackend:
         )
         self._engine.connect_to_format_(self._player, self._mixer_node, player_format)
 
-        # 4. Enable voice processing (system-level AEC + NS) on inputNode
-        error_ptr = None
-        try:
-            ok = self._input_node.setVoiceProcessingEnabled_error_(True, error_ptr)
-            if not ok:
-                _log("WARNING: voice processing not available on this device/macOS version.")
-        except (AttributeError, TypeError):
-            # Older PyObjC binding or not supported
-            _log("WARNING: setVoiceProcessingEnabled:error: not available — trying simpler form.")
-            try:
-                self._input_node.setVoiceProcessingEnabled_(True)
-            except (AttributeError, TypeError):
-                _log("WARNING: voice processing unavailable — proceeding without AEC.")
+        # 4. Voice processing (system-level AEC + NS) is NOT enabled here.
+        #    macOS ducks all other app audio while VP is active, so we only
+        #    enable it on-demand via _set_voice_processing(True) when the mic
+        #    tap actually needs echo cancellation (e.g. ask_user_voice).
+        #    speak_message (TTS-only / barge-in) works without VP.
 
         # 5. Start engine
         try:
@@ -298,6 +292,79 @@ class AVAudioBackend:
             )
         except Exception as exc:
             _log(f"WARNING: could not register config change notification: {exc}")
+
+    def _ensure_engine_running(self) -> None:
+        """Start the AVAudioEngine if it is currently suspended."""
+        if self._running:
+            return
+
+        # After engine.stop(), node connections are invalidated.
+        # Reconnect the player node before restarting — same as _restart_engine.
+        AVFoundation = self._AVFoundation
+        try:
+            output_rate = float(self._mixer_node.outputFormatForBus_(0).sampleRate())
+            player_format = AVFoundation.AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(
+                AVFoundation.AVAudioPCMFormatFloat32,
+                output_rate,
+                1,
+                True,
+            )
+            self._engine.connect_to_format_(self._player, self._mixer_node, player_format)
+        except Exception as exc:
+            _log(f"WARNING: could not reconnect player on resume: {exc}")
+
+        # Do NOT re-enable voice processing here — it causes macOS audio ducking.
+        # VP is only enabled on-demand by install_mic_tap(voice_processing=True).
+
+        started = self._engine.startAndReturnError_(None)
+        if not started:
+            raise RuntimeError("AVAudioEngine failed to start.")
+        self._running = True
+        try:
+            self._player.play()
+        except Exception:
+            pass
+        _log("AVAudioBackend: engine resumed.")
+
+    def _set_voice_processing(self, enabled: bool) -> None:
+        """Toggle voice processing (AEC) on the input node.
+
+        When voice processing is active, macOS ducks other app audio.
+        Disabling it when idle prevents unwanted ducking of Safari/YouTube etc.
+        """
+        if self._vp_enabled == enabled:
+            return
+        try:
+            result = self._input_node.setVoiceProcessingEnabled_error_(enabled, None)
+            if isinstance(result, tuple):
+                ok = result[0]
+            else:
+                ok = result
+            if ok:
+                self._vp_enabled = enabled
+                _log(f"AVAudioBackend: voice processing {'enabled' if enabled else 'disabled'}.")
+            else:
+                _log(f"WARNING: setVoiceProcessingEnabled({enabled}) returned False.")
+        except (AttributeError, TypeError):
+            try:
+                self._input_node.setVoiceProcessingEnabled_(enabled)
+                self._vp_enabled = enabled
+                _log(f"AVAudioBackend: voice processing {'enabled' if enabled else 'disabled'} (legacy API).")
+            except (AttributeError, TypeError):
+                _log("WARNING: voice processing toggle unavailable.")
+
+    def _suspend_engine_if_idle(self) -> None:
+        """Stop the AVAudioEngine when no mic tap is installed."""
+        if not self._running or self._tap_installed:
+            return
+        # Disable voice processing before stopping to release macOS audio ducking
+        self._set_voice_processing(False)
+        try:
+            self._engine.stop()
+        except Exception:
+            pass
+        self._running = False
+        _log("AVAudioBackend: engine suspended.")
 
     def _restart_engine(self) -> None:
         """Handle AVAudioEngine configuration change (device change).
@@ -358,9 +425,11 @@ class AVAudioBackend:
             self._player.play()
             _log("AVAudioBackend: engine restarted after config change.")
 
-            # 5. Re-install mic tap if one was active.
+            # 5. Re-install mic tap if one was active, preserving VP state.
             if had_tap and saved_callback is not None:
-                self.install_mic_tap(saved_callback)
+                saved_vp = self._vp_enabled
+                self._vp_enabled = False  # reset so _set_voice_processing will act
+                self.install_mic_tap(saved_callback, voice_processing=saved_vp)
 
         except Exception as exc:
             _log(f"ERROR: AVAudioBackend config change handler: {exc}")
@@ -369,7 +438,11 @@ class AVAudioBackend:
     # Mic tap
     # ------------------------------------------------------------------
 
-    def install_mic_tap(self, callback: Callable[[np.ndarray], None]) -> None:
+    def install_mic_tap(
+        self,
+        callback: Callable[[np.ndarray], None],
+        voice_processing: bool = True,
+    ) -> None:
         """Install a tap on the input node; deliver 16kHz/512-sample chunks.
 
         The tap callback ONLY enqueues raw audio (bounded queue, non-blocking
@@ -380,14 +453,24 @@ class AVAudioBackend:
         ----------
         callback:
             Called with each 512-sample float32 chunk at 16kHz.
+        voice_processing:
+            Enable system AEC (voice processing) on the input node.
+            True for ask_user_voice (clean recording needed).
+            False for speak_message barge-in (avoids macOS audio ducking).
         """
         if self._tap_installed:
             _log("WARNING: mic tap already installed — ignoring.")
             return
 
+        self._ensure_engine_running()
+
+        # Enable/disable voice processing BEFORE installing the tap.
+        # VP changes the input node's format, so we must set it first.
+        self._set_voice_processing(voice_processing)
+
         self._tap_callback = callback
 
-        # Query the actual capture rate AFTER voice processing is enabled.
+        # Query the actual capture rate AFTER voice processing state is set.
         # VP can change the input node's format (e.g. 44.1kHz→48kHz, mono→multi-channel).
         # We pass None as the tap format to use the native format and avoid -10865 errors.
         vp_fmt = self._input_node.outputFormatForBus_(0)
@@ -449,6 +532,8 @@ class AVAudioBackend:
         """Remove the mic tap and stop the consumer thread."""
         if not self._tap_installed:
             return
+        # Disable voice processing immediately to stop macOS audio ducking
+        self._set_voice_processing(False)
         try:
             self._input_node.removeTapOnBus_(0)
         except Exception as exc:
@@ -458,6 +543,7 @@ class AVAudioBackend:
         if self._consumer_thread is not None:
             self._consumer_thread.join(timeout=2.0)
         _log("AVAudioBackend: mic tap removed.")
+        self._suspend_engine_if_idle()
 
     # ------------------------------------------------------------------
     # Playback
@@ -482,7 +568,7 @@ class AVAudioBackend:
             last buffer has been rendered.
         """
         if not self._running:
-            return
+            self._ensure_engine_running()
 
         AVFoundation = self._AVFoundation
 
@@ -539,11 +625,7 @@ class AVAudioBackend:
         """Remove tap, stop engine, release resources."""
         if self._tap_installed:
             self.remove_mic_tap()
-        try:
-            self._engine.stop()
-        except Exception:
-            pass
-        self._running = False
+        self._suspend_engine_if_idle()
         _log("AVAudioBackend: engine stopped.")
 
 
@@ -661,11 +743,20 @@ class MacOSContinuousListener:
         self._barge_in_accumulated_speech = 0.0
         self._barge_in_silence_started = None
 
-    def set_active(self, active: bool) -> None:
-        """Enable or disable speech collection (voice mode toggle)."""
+    def set_active(self, active: bool, voice_processing: bool = True) -> None:
+        """Enable or disable speech collection (voice mode toggle).
+
+        Parameters
+        ----------
+        active:
+            True to start listening, False to stop.
+        voice_processing:
+            When True, enable system AEC (causes macOS audio ducking).
+            Set to False for barge-in-only monitoring during TTS playback.
+        """
         if active:
             if not getattr(self, "_backend_tap_active", False):
-                self._backend.install_mic_tap(self._process_chunk)
+                self._backend.install_mic_tap(self._process_chunk, voice_processing=voice_processing)
                 self._backend_tap_active = True
             self.drain_queue()
             self._active.set()
@@ -912,7 +1003,7 @@ class MacOSTTSEngine:
     """
 
     _VOICE = 'af_heart'
-    _SPEED = 1.3
+    _SPEED = 1.2
     _REPO_ID = 'hexgrad/Kokoro-82M'
 
     def __init__(self, backend: "AVAudioBackend") -> None:
@@ -969,15 +1060,15 @@ class MacOSTTSEngine:
     def _stream_speak(self, text: str) -> None:
         """Run the Kokoro generator and feed each chunk to the backend.
 
-        Blocks until all scheduled audio has finished playing through the
-        speakers.  Uses a threading.Event signalled by the AVAudioPlayerNode
-        completion handler on the last buffer so that speak() only returns
-        after the audio is audibly done.
+        Streams chunks to AVAudioPlayerNode as they arrive from Kokoro so
+        the first audio is heard with minimal latency.  A completion handler
+        on the *last* scheduled buffer signals when playback is done.
         """
         generator = self._pipeline(text, voice=self._VOICE, speed=self._SPEED)
 
-        # Collect all valid chunks first so we know which one is last.
-        chunks: list[np.ndarray] = []
+        prev_chunk: Optional[np.ndarray] = None
+        done_event = threading.Event()
+
         for result in generator:
             if self._stop_event.is_set():
                 break
@@ -995,25 +1086,20 @@ class MacOSTTSEngine:
             if chunk.size == 0:
                 continue
 
-            chunks.append(chunk)
+            # Schedule the *previous* chunk without a completion handler
+            # (we don't yet know if this new chunk is the last one).
+            if prev_chunk is not None:
+                self._backend.play_audio(prev_chunk)
+            prev_chunk = chunk
 
-        if not chunks or self._stop_event.is_set():
+        if prev_chunk is None or self._stop_event.is_set():
             return
 
-        # Schedule all but the last chunk without a completion handler.
-        for chunk in chunks[:-1]:
-            if self._stop_event.is_set():
-                return
-            self._backend.play_audio(chunk)
-
-        # Schedule the last chunk with a completion handler so we know when
-        # playback has truly finished.
-        done_event = threading.Event()
-
+        # Schedule the final chunk with a completion handler.
         def _on_complete() -> None:
             done_event.set()
 
-        self._backend.play_audio(chunks[-1], completion_handler=_on_complete)
+        self._backend.play_audio(prev_chunk, completion_handler=_on_complete)
 
         # Wait for the last buffer to finish playing (up to 30 s safety timeout).
         done_event.wait(timeout=30.0)

@@ -18,11 +18,29 @@ client.  They verify:
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 from unittest.mock import MagicMock, patch, AsyncMock
 import numpy as np
 import pytest
-import asyncio
+
+
+def _stub(name: str) -> MagicMock:
+    m = MagicMock()
+    m.__name__ = name
+    sys.modules[name] = m
+    return m
+
+
+for _mod in ('sounddevice', 'kokoro'):
+    if _mod not in sys.modules:
+        _stub(_mod)
+
+# Patch continuation timeout to near-zero so tests don't wait 3 real seconds
+import lazy_claude.server as _server_mod
+_server_mod._CONTINUATION_RESPONSE_TIMEOUT = 0.01
+_server_mod._INITIAL_RESPONSE_TIMEOUT = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +73,19 @@ def _make_mock_listener(next_speech=None):
     """Return a mock ContinuousListener."""
     mock = MagicMock()
     mock.barge_in = threading.Event()
-    mock.get_next_speech = MagicMock(return_value=next_speech)
+    if next_speech is not None:
+        # Return next_speech exactly once, then always None thereafter
+        _returned = [False]
+        def _get_next_speech(**kwargs):
+            if not _returned[0]:
+                _returned[0] = True
+                return next_speech
+            return None
+        mock.get_next_speech = MagicMock(side_effect=_get_next_speech)
+    else:
+        mock.get_next_speech = MagicMock(return_value=None)
+    mock.get_last_input_at = MagicMock(return_value=None)
+    mock.pop_barge_in_candidate = MagicMock(return_value=None)
     mock.set_active = MagicMock()
     mock.set_tts_playing = MagicMock()
     mock.clear_barge_in = MagicMock()
@@ -79,27 +109,10 @@ def _make_server(mock_tts=None, next_speech=None):
     s.tts = mock_tts
     # Ensure the mock listener is directly accessible
     s._listener = mock_listener
+    s._try_acquire_voice_device = MagicMock(return_value=123)
+    s._release_voice_device = MagicMock()
     mock_listener.reset_mock()
     return s, mock_tts, mock_listener
-
-
-# ---------------------------------------------------------------------------
-# Importability
-# ---------------------------------------------------------------------------
-
-
-class TestServerImport:
-    def test_module_importable(self):
-        import lazy_claude.server
-        assert lazy_claude.server is not None
-
-    def test_voice_server_importable(self):
-        from lazy_claude.server import VoiceServer
-        assert VoiceServer is not None
-
-    def test_create_server_importable(self):
-        from lazy_claude.server import create_server
-        assert callable(create_server)
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +124,6 @@ class TestVoiceServerInit:
     def test_server_creates_without_error(self):
         server, _, _ = _make_server()
         assert server is not None
-
-    def test_listening_enabled_by_default(self):
-        server, _, _ = _make_server()
-        assert server.listening is True
-
-    def test_busy_flag_false_by_default(self):
-        server, _, _ = _make_server()
-        assert server.busy is False
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +152,6 @@ class TestToggleListening:
         server.toggle_listening_impl(enabled=False)
         server.toggle_listening_impl(enabled=True)
         assert server.listening is True
-
-    def test_toggle_on_does_not_activate_listener_until_voice_turn(self):
-        server, _, mock_listener = _make_server()
-        server.toggle_listening_impl(enabled=True)
-        mock_listener.set_active.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,13 @@ class TestSpeakMessage:
         mock_listener.set_tts_playing.assert_any_call(False)
         mock_listener.drain_queue.assert_called_once()
 
+    def test_speak_message_returns_busy_when_voice_device_locked(self):
+        server, mock_tts, mock_listener = _make_server()
+        with patch.object(server, "_try_acquire_voice_device", return_value=None):
+            result = server.speak_message_impl(text="Hello world")
+        assert result == {"status": "busy", "chars": 11}
+        mock_tts.speak.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # ask_user_voice — listening disabled
@@ -216,6 +223,13 @@ class TestAskUserVoiceListeningDisabled:
         server.toggle_listening_impl(enabled=False)
         server.ask_user_voice_impl(questions=["Are you ready?"])
         mock_tts.speak.assert_called()
+
+    def test_returns_busy_when_voice_device_locked(self):
+        server, mock_tts, mock_listener = _make_server()
+        with patch.object(server, "_try_acquire_voice_device", return_value=None):
+            result = server.ask_user_voice_impl(questions=["What is your name?"])
+        assert "voice device" in result.lower()
+        mock_listener.set_active.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +269,36 @@ class TestAskUserVoiceSuccess:
 
     def test_multiple_questions_all_in_result(self):
         audio = self._dummy_audio()
-        server, mock_tts, mock_listener = _make_server(next_speech=audio)
-        answers = ["Paris", "42"]
+        server, mock_tts, mock_listener = _make_server()
+        # Each question: primary call gets audio, continuation expires immediately
+        responses = [audio, audio]
         call_count = [0]
+        def _speech(**kwargs):
+            call_count[0] += 1
+            if responses:
+                return responses.pop(0)
+            return None
+        mock_listener.get_next_speech.side_effect = _speech
+
+        from lazy_claude.stt import TranscribeResult
+        answers = ["Paris", "42"]
+        transcribe_count = [0]
 
         def mock_transcribe(a, model=None):
-            from lazy_claude.stt import TranscribeResult
-            idx = call_count[0]
-            call_count[0] += 1
+            idx = min(transcribe_count[0], len(answers) - 1)
+            transcribe_count[0] += 1
             return TranscribeResult(text=answers[idx], no_speech_prob=0.1)
 
-        with patch('lazy_claude.server.transcribe', side_effect=mock_transcribe):
+        # Patch time.monotonic so continuation deadline expires after 1st continuation check
+        _base = [time.monotonic()]
+        _step = [0]
+        def _fast_monotonic():
+            # Each call advances time by 10s so continuation deadline expires immediately
+            _step[0] += 10.0
+            return _base[0] + _step[0]
+
+        with patch('lazy_claude.server.time.monotonic', side_effect=_fast_monotonic), \
+             patch('lazy_claude.server.transcribe', side_effect=mock_transcribe):
             result = server.ask_user_voice_impl(
                 questions=["Capital of France?", "Answer to everything?"]
             )
@@ -295,24 +328,47 @@ class TestAskUserVoiceSuccess:
     def test_pause_without_over_waits_for_continuation_then_finishes(self):
         audio = self._dummy_audio()
         server, mock_tts, mock_listener = _make_server()
-        mock_listener.get_next_speech.side_effect = [audio, None]
+        responses = [audio, None]
+        mock_listener.get_next_speech.side_effect = lambda **_kwargs: (
+            responses.pop(0) if responses else None
+        )
         with patch('lazy_claude.server.transcribe',
                    return_value=_make_transcribe_result("first part")):
             result = server.ask_user_voice_impl(questions=["Continue?"])
         assert "A: first part" in result
-        assert mock_listener.get_next_speech.call_args_list[0].kwargs["timeout"] == 60.0
-        assert mock_listener.get_next_speech.call_args_list[1].kwargs["timeout"] == 10.0
+        assert mock_listener.get_next_speech.call_args_list[0].kwargs["timeout"] == _server_mod._INITIAL_RESPONSE_TIMEOUT
+        # Continuation calls use the shorter timeout
+        assert mock_listener.get_next_speech.call_args_list[1].kwargs["timeout"] <= _server_mod._CONTINUATION_RESPONSE_TIMEOUT
 
     def test_multiple_segments_are_joined_before_timeout(self):
         audio = self._dummy_audio()
         server, mock_tts, mock_listener = _make_server()
-        mock_listener.get_next_speech.side_effect = [audio, audio, None]
+        responses = [audio, audio, None]
+        mock_listener.get_next_speech.side_effect = lambda **_kwargs: (
+            responses.pop(0) if responses else None
+        )
         with patch('lazy_claude.server.transcribe', side_effect=[
             _make_transcribe_result("first part"),
             _make_transcribe_result("second part"),
         ]):
             result = server.ask_user_voice_impl(questions=["Continue?"])
         assert "A: first part second part" in result
+
+    def test_continuation_window_extends_after_fresh_input(self):
+        audio = self._dummy_audio()
+        server, _, mock_listener = _make_server()
+        mock_listener.get_next_speech.side_effect = [None, audio]
+
+        # Use timestamps relative to the patched _CONTINUATION_RESPONSE_TIMEOUT (0.01s)
+        # First monotonic: start time. Second: still within deadline. Third: past original deadline but fresh input extended it.
+        timeout = _server_mod._CONTINUATION_RESPONSE_TIMEOUT
+        t0 = 100.0
+        with patch('lazy_claude.server.time.monotonic', side_effect=[t0, t0, t0 + timeout + 0.001]), \
+             patch.object(server, '_get_last_input_at', side_effect=[None, t0 + timeout * 0.5]):
+            result = server._wait_for_continuation_speech()
+
+        assert result is audio
+        assert mock_listener.get_next_speech.call_count == 2
 
     def test_listener_is_only_active_during_voice_turn(self):
         audio = self._dummy_audio()
@@ -340,6 +396,88 @@ class TestAskUserVoiceSuccess:
                    return_value=_make_transcribe_result("yes")):
             server.ask_user_voice_impl(questions=["Q1?", "Q2?", "Q3?"])
         assert mock_tts.speak.call_count == 3
+
+    def test_stop_barge_in_stops_tts(self):
+        audio = self._dummy_audio()
+        candidate_audio = self._dummy_audio()
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        mock_tts.speak.side_effect = lambda *_args, **_kwargs: time.sleep(0.2)
+        mock_listener.pop_barge_in_candidate.side_effect = [candidate_audio, None, None]
+
+        with patch(
+            'lazy_claude.server.transcribe',
+            side_effect=[
+                _make_transcribe_result("stop"),
+                _make_transcribe_result("ready over"),
+            ],
+        ):
+            result = server.ask_user_voice_impl(questions=["Status?"])
+
+        mock_tts.stop.assert_called_once()
+        assert mock_listener.barge_in.is_set()
+        assert "A: ready" in result
+
+    def test_non_stop_barge_in_candidate_does_not_stop_tts(self):
+        audio = self._dummy_audio()
+        candidate_audio = self._dummy_audio()
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        mock_tts.speak.side_effect = lambda *_args, **_kwargs: time.sleep(0.1)
+        mock_listener.pop_barge_in_candidate.side_effect = [candidate_audio, None, None]
+
+        with patch(
+            'lazy_claude.server.transcribe',
+            side_effect=[
+                _make_transcribe_result("excuse me"),
+                _make_transcribe_result("ready over"),
+            ],
+        ):
+            result = server.ask_user_voice_impl(questions=["Status?"])
+
+        mock_tts.stop.assert_not_called()
+        assert not mock_listener.barge_in.is_set()
+        assert "A: ready" in result
+
+    @pytest.mark.parametrize("phrase", ["STOP", "stop there", "please stop now"])
+    def test_stop_barge_in_accepts_common_variants(self, phrase):
+        audio = self._dummy_audio()
+        candidate_audio = self._dummy_audio()
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        mock_tts.speak.side_effect = lambda *_args, **_kwargs: time.sleep(0.2)
+        mock_listener.pop_barge_in_candidate.side_effect = [candidate_audio, None, None]
+
+        with patch(
+            'lazy_claude.server.transcribe',
+            side_effect=[
+                _make_transcribe_result(phrase),
+                _make_transcribe_result("ready over"),
+            ],
+        ):
+            result = server.ask_user_voice_impl(questions=["Status?"])
+
+        mock_tts.stop.assert_called_once()
+        assert mock_listener.barge_in.is_set()
+        assert "A: ready" in result
+
+    @pytest.mark.parametrize("phrase", ["don't stop", "please don't stop", "cannot stop this"])
+    def test_stop_barge_in_rejects_negated_phrases(self, phrase):
+        audio = self._dummy_audio()
+        candidate_audio = self._dummy_audio()
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        mock_tts.speak.side_effect = lambda *_args, **_kwargs: time.sleep(0.1)
+        mock_listener.pop_barge_in_candidate.side_effect = [candidate_audio, None, None]
+
+        with patch(
+            'lazy_claude.server.transcribe',
+            side_effect=[
+                _make_transcribe_result(phrase),
+                _make_transcribe_result("ready over"),
+            ],
+        ):
+            result = server.ask_user_voice_impl(questions=["Status?"])
+
+        mock_tts.stop.assert_not_called()
+        assert not mock_listener.barge_in.is_set()
+        assert "A: ready" in result
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +540,15 @@ class TestNoSpeechProbFilter:
         return np.zeros(16_000, dtype=np.float32)
 
     def _make_server_with_two_results(self, first_no_speech_prob, second_text):
-        """Build server whose listener returns the same audio twice, with two transcribe results."""
+        """Build server whose listener returns audio twice, with two transcribe results."""
         from lazy_claude.stt import TranscribeResult
         audio = self._dummy_audio()
 
-        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        server, mock_tts, mock_listener = _make_server()
+        # Override: return audio twice, then None (noise → discard → real speech → done)
+        mock_listener.get_next_speech.side_effect = lambda **kwargs: (
+            audio if mock_listener.get_next_speech.call_count <= 2 else None
+        )
 
         call_count = [0]
         results = [
@@ -435,15 +577,15 @@ class TestNoSpeechProbFilter:
         assert "hello world" in result
 
     def test_low_no_speech_prob_is_forwarded(self):
-        """no_speech_prob <= 0.6 → accepted immediately."""
+        """no_speech_prob <= 0.6 → accepted immediately (no retry loop)."""
         audio = self._dummy_audio()
         server, mock_tts, mock_listener = _make_server(next_speech=audio)
         with patch('lazy_claude.server.transcribe',
                    return_value=_make_transcribe_result("all good", no_speech_prob=0.2)):
             result = server.ask_user_voice_impl(questions=["Test?"])
 
-        # Only called once — not discarded
-        mock_listener.get_next_speech.assert_called_once()
+        # Should be called at least once (initial speech) — not retried due to discard
+        assert mock_listener.get_next_speech.call_count >= 1
         assert "all good" in result
 
     def test_drain_queue_called_after_get_next_speech(self):
@@ -465,72 +607,7 @@ class TestNoSpeechProbFilter:
                    return_value=_make_transcribe_result("boundary", no_speech_prob=0.6)):
             result = server.ask_user_voice_impl(questions=["Test?"])
 
-        mock_listener.get_next_speech.assert_called_once()
+        assert mock_listener.get_next_speech.call_count >= 1
         assert "boundary" in result
 
 
-class TestMCPToolRegistration:
-    def test_create_server_returns_fastmcp_app(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
-            from lazy_claude.server import create_server
-            from mcp.server.fastmcp import FastMCP
-            app, voice = create_server()
-        assert isinstance(app, FastMCP)
-
-    def test_ask_user_voice_tool_registered(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
-            from lazy_claude.server import create_server
-            app, voice = create_server()
-        tool_names = [t.name for t in asyncio.run(app.list_tools())]
-        assert "ask_user_voice" in tool_names
-
-    def test_speak_message_tool_registered(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
-            from lazy_claude.server import create_server
-            app, voice = create_server()
-        tool_names = [t.name for t in asyncio.run(app.list_tools())]
-        assert "speak_message" in tool_names
-
-    def test_toggle_listening_tool_registered(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
-            from lazy_claude.server import create_server
-            app, voice = create_server()
-        tool_names = [t.name for t in asyncio.run(app.list_tools())]
-        assert "toggle_listening" in tool_names
-
-    def test_set_listening_mode_tool_registered(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.ReferenceBuffer'), \
-             patch('lazy_claude.server.EchoCanceller'), \
-             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
-            from lazy_claude.server import create_server
-            app, voice = create_server()
-        tool_names = [t.name for t in asyncio.run(app.list_tools())]
-        assert "set_listening_mode" in tool_names

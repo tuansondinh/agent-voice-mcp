@@ -43,7 +43,10 @@ from lazy_claude.stdout_guard import get_mcp_stdout  # noqa: E402 (intentional e
 # Default (unset or "0"): wake-word-only mode when a detector is available.
 ENV_LAZY_CLAUDE_ALWAYS_ON = "LAZY_CLAUDE_ALWAYS_ON"
 _VOICE_SUBMIT_KEYWORD_RE = re.compile(r"(?i)\bover\b[\s.!?,:;]*$")
-_VOICE_STOP_KEYWORD_RE = re.compile(r"(?i)^\s*stop(?:\s+stop)*[\s.!?,:;]*$")
+_VOICE_STOP_KEYWORD_RE = re.compile(r"(?i)\bstop\b")
+_VOICE_STOP_EXCLUDED_PHRASE_RE = re.compile(
+    r"(?i)\b(?:don't|dont|do not|cannot|can't|cant|won't|wont|wouldn't|wouldnt|shouldn't|shouldnt|please don't|please dont)\s+stop\b"
+)
 _INITIAL_RESPONSE_TIMEOUT = 60.0
 _CONTINUATION_RESPONSE_TIMEOUT = 3.0
 _CONTINUATION_POLL_INTERVAL = 0.05
@@ -66,7 +69,12 @@ def _strip_voice_submit_keyword(text: str) -> tuple[str, bool]:
 
 def _is_stop_barge_in(text: str) -> bool:
     """Return True when a barge-in utterance is an explicit STOP command."""
-    return bool(_VOICE_STOP_KEYWORD_RE.match(text.strip()))
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if _VOICE_STOP_EXCLUDED_PHRASE_RE.search(normalized):
+        return False
+    return bool(_VOICE_STOP_KEYWORD_RE.search(normalized))
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +145,7 @@ class VoiceServer:
 
     def _try_acquire_voice_device(self) -> int | None:
         """Acquire the shared mic/TTS device lock across processes."""
-        lock_fd = os.open(_VOICE_DEVICE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(_VOICE_DEVICE_LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -293,7 +301,9 @@ class VoiceServer:
             try:
                 self._listener.clear_barge_in()
                 self._listener.set_tts_playing(True)
-                self._listener.set_active(True)
+                # voice_processing=False: don't enable AEC for barge-in monitoring.
+                # This prevents macOS from ducking other app audio during TTS.
+                self._listener.set_active(True, voice_processing=False)
 
                 tts_thread = threading.Thread(
                     target=self._speak_safe, args=(text,), daemon=True
