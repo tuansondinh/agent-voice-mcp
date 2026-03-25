@@ -172,3 +172,15 @@ Summary: 4 passed, 0 failed, 1 skipped (partial pass noted)
 - [x] Old modules preserved and functional
 - [x] All existing tests pass
 - [x] ask_user_voice works E2E without echo
+
+---
+
+## Documentation
+
+Date: 2026-03-25
+Commit: docs: update docs for Plan #4 — macOS System AEC via AVAudioEngine
+
+Updated files:
+- README.md: updated Architecture section (both paths), Dependencies (pyobjc optional), Project Structure (av_audio.py added)
+- ARCHITECTURE.md: created — full architecture guide with ASCII data flow diagrams, threading model, barge-in flow, fallback strategy
+- .ralph-teams/PLAN-4.md: status changed from `approved` to `complete`

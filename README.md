@@ -56,33 +56,6 @@ If Claude Code is already running, restart it so the new MCP server is loaded.
 
 That is enough for installation. No `CLAUDE.md` changes are required just to make the MCP server available.
 
-### Optional: Global Voice-Mode Prompt
-
-The MCP server works without any prompt-file changes, but users will not get the same hands-free workflow unless their global prompt tells the agent when to enter voice mode and how to stay there.
-
-If you want the same experience, add a section like this to your global `CLAUDE.md`:
-
-```markdown
-## Voice I/O
-- `agent-voice-mcp` MCP provides voice input/output integration for hands-free workflows
-- Tool: `mcp__agent-voice-mcp__ask_user_voice` speaks questions aloud and records voice replies
-- Tool: `mcp__agent-voice-mcp__speak_message` speaks short confirmations or updates
-
-### Voice Mode Toggle
-- Voice mode is OFF by default
-- Voice mode is activated when your preferred trigger fires, for example a keybinding or explicit user request
-- On activation, call `mcp__agent-voice-mcp__ask_user_voice` with: "Now in voice mode. What would you like to do?"
-- Stay in voice mode for the rest of the conversation until the user explicitly exits it
-
-### Voice Mode Rules
-- While in voice mode, never ask for typed replies
-- Use `mcp__agent-voice-mcp__ask_user_voice` for all follow-up questions
-- Use `mcp__agent-voice-mcp__speak_message` for short spoken confirmations when useful
-- Exit voice mode only when the user says something like "exit voice mode", "stop voice mode", or "back to text"
-- Do not leave voice mode because of errors or tool failures; keep interacting by voice unless the user explicitly switches back to text
-```
-
-This prompt setup is recommended if you want the full voice-mode behavior. MCP installation alone only makes the tools available.
 
 ## How To Use
 
