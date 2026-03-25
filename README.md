@@ -41,7 +41,7 @@ That's it — Claude Code will download and run the server automatically on next
 ## Prerequisites
 
 ### System Requirements
-- **macOS** (Apple Silicon or Intel)
+- **macOS** (Apple Silicon or Intel) or Linux/Windows with fallback
 - **Python** 3.12+
 - **System Tools**:
   ```bash
@@ -52,11 +52,22 @@ That's it — Claude Code will download and run the server automatically on next
 Automatically installed via `pyproject.toml`:
 - `kokoro` — High-quality text-to-speech engine
 - `pywhispercpp` — Fast speech-to-text (Whisper.cpp binding)
-- `sounddevice` — Audio input/output
+- `sounddevice` — Audio input/output (fallback path)
 - `soundfile` — Audio file handling
-- `onnxruntime` — ML inference for TTS
+- `onnxruntime` — ML inference for TTS and VAD
 - `mcp[cli]` — Model Context Protocol server framework
 - `numpy` — Numerical computing
+
+**macOS-specific (optional, for system AEC)**:
+- `pyobjc-framework-AVFoundation` — AVAudioEngine bindings
+- `pyobjc-framework-Foundation` — Device change notifications
+
+Install with macOS support:
+```bash
+pip install -e '.[macos]'
+# or
+uv sync --all-extras
+```
 
 ## Setup
 
@@ -167,17 +178,26 @@ Use the ask_user_voice tool to get the user's voice input on whether to proceed 
 
 ## Architecture
 
-### Core Components
-- **`server.py`** — MCP server setup and tool registration
-- **`stt.py`** — Speech-to-text using Whisper.cpp
-- **`tts.py`** — Text-to-speech using Kokoro; pushes audio into AEC reference buffer
-- **`audio.py`** — Always-on mic with VAD, barge-in detection, and device change handling
-- **`aec.py`** — Acoustic Echo Cancellation (AEC) pipeline
-- **`stdout_guard.py`** — Prevents audio interference with Claude Code output
+The server supports **two audio backends**, automatically selected at startup:
 
-### Acoustic Echo Cancellation (AEC)
+### macOS System AEC Path (Preferred)
+On macOS, the server uses `AVAudioEngine` with the Voice Processing IO audio unit
+(same tech as FaceTime) for instant, hardware-level echo cancellation:
 
-The server uses a multi-stage AEC pipeline to suppress TTS echo at the microphone:
+- **Single `AVAudioBackend` instance** manages both mic input and TTS output through
+  one `AVAudioEngine` with voice processing enabled
+- **Instant echo cancellation** — no convergence time, system AEC handles it all
+- **Mic tap** at native hardware rate (44.1 or 48 kHz) → resample to 16 kHz → deliver
+  512-sample chunks to VAD
+- **No custom AEC code** — system provides automatic noise suppression + AGC
+- **No ReferenceBuffer** — system AEC sees the output automatically
+- **Device change recovery** — engine restarts on speaker/headphone/Bluetooth switches
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed macOS path flow and AVAudioBackend internals.
+
+### Fallback Path (Non-macOS or on Failure)
+When macOS AVAudioEngine is unavailable or fails, the server falls back to `sounddevice`
+with a custom adaptive AEC pipeline:
 
 1. **PBFDLMS adaptive filter** — Partitioned-block frequency-domain LMS filter that
    learns and cancels the speaker-to-microphone acoustic path in real time.
@@ -187,11 +207,22 @@ The server uses a multi-stage AEC pipeline to suppress TTS echo at the microphon
    and TTS overlap, preventing filter divergence.
 4. **Fallback gate** — Suppresses chunks with high residual power during TTS playback
    when AEC has not yet converged (safety net for the first few seconds).
-5. **Device change handling** — When PortAudio reports a device change, filter
-   coefficients are reset and delay estimation re-runs automatically.
+5. **AEC calibration chirp** — At startup, a quiet 1.5-second chirp (200–4000 Hz)
+   plays to train the filter before real TTS utterances.
 
 The mic stays open throughout TTS playback — no hard muting. Barge-in works by running
 VAD on the AEC-cleaned signal; when the user speaks, VAD fires and TTS stops.
+
+**Fallback components:**
+- **`audio.py`** — ContinuousListener with sounddevice + VAD + barge-in
+- **`tts.py`** — TTSEngine with sounddevice output + ReferenceBuffer for AEC
+- **`aec.py`** — PBFDLMS filter + RES + DTD + device change handling
+
+### Shared Components
+- **`server.py`** — MCP server setup, path detection, tool registration
+- **`av_audio.py`** — AVAudioBackend, MacOSContinuousListener, MacOSTTSEngine (macOS only)
+- **`stt.py`** — Speech-to-text using Whisper.cpp (both paths)
+- **`stdout_guard.py`** — Prevents audio interference with Claude Code output
 
 ### Manual AEC Test Script
 
@@ -266,19 +297,22 @@ uv run python -m lazy_claude
 ```
 claude-voice/
 ├── lazy_claude/
-│   ├── __main__.py          # Entry point
-│   ├── server.py            # MCP server and tool definitions
-│   ├── stt.py               # Speech-to-text implementation
-│   ├── tts.py               # Text-to-speech implementation
-│   ├── audio.py             # Always-on mic, VAD, barge-in, device change
-│   ├── aec.py               # Acoustic Echo Cancellation (PBFDLMS + RES + DTD)
-│   ├── stdout_guard.py      # Output safety wrapper
-│   └── models/              # Model files and utilities
+│   ├── __main__.py              # Entry point
+│   ├── server.py                # MCP server, path detection, tool definitions
+│   ├── av_audio.py              # macOS: AVAudioBackend, MacOSContinuousListener, MacOSTTSEngine
+│   ├── audio.py                 # Fallback: ContinuousListener with sounddevice + VAD
+│   ├── tts.py                   # Fallback: TTSEngine with sounddevice + ReferenceBuffer
+│   ├── aec.py                   # Fallback: PBFDLMS + RES + DTD echo cancellation
+│   ├── stt.py                   # Speech-to-text (both paths)
+│   ├── stdout_guard.py          # Output safety wrapper
+│   └── models/                  # Model files and utilities
 ├── scripts/
-│   └── test_aec_manual.py   # Manual AEC before/after comparison tool
-├── tests/                   # Test suite
-├── pyproject.toml           # Project metadata and dependencies
-└── README.md                # This file
+│   ├── test_aec_manual.py       # Manual AEC before/after comparison (fallback path)
+│   └── test_macos_aec.py        # Manual macOS AEC test (system path)
+├── tests/                       # Test suite (unit + integration)
+├── ARCHITECTURE.md              # Detailed architecture guide
+├── pyproject.toml               # Project metadata and dependencies
+└── README.md                    # This file
 ```
 
 ## Requirements Specification
