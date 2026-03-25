@@ -1,0 +1,13 @@
+{
+  "name": "agent-voice",
+  "description": "Full voice mode for Claude Code — speak your requests, hear responses via TTS, hands-free coding.",
+  "version": "0.1.2",
+  "author": {
+    "name": "tuansondinh"
+  },
+  "homepage": "https://github.com/tuansondinh/agent-voice-mcp",
+  "repository": "https://github.com/tuansondinh/agent-voice-mcp",
+  "license": "MIT",
+  "keywords": ["voice", "tts", "stt", "whisper", "hands-free", "mcp"],
+  "skills": "./skills/"
+}

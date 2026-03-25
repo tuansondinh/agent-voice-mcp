@@ -1,0 +1,21 @@
+{
+  "name": "agent-voice-claude-plugin",
+  "owner": {
+    "name": "tuansondinh"
+  },
+  "metadata": {
+    "description": "Full voice mode for Claude Code — speak your requests, hear responses via TTS, hands-free coding.",
+    "version": "0.1.2"
+  },
+  "plugins": [
+    {
+      "name": "agent-voice",
+      "source": "./",
+      "description": "Activate full voice mode in Claude Code. Speak your requests, Claude responds via TTS. Supports wake word, VAD, Whisper STT, and Kokoro TTS. Requires the agent-voice MCP server to be running.",
+      "version": "0.1.2",
+      "keywords": ["voice", "tts", "stt", "whisper", "hands-free", "mcp"],
+      "category": "productivity",
+      "skills": "./skills/"
+    }
+  ]
+}
