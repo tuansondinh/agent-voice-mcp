@@ -20,11 +20,14 @@ toggle_listening(enabled: bool) -> dict
 
 from __future__ import annotations
 
+import fcntl
+import os
 import re
 import sys
 import threading
 import time
 from io import TextIOWrapper
+from pathlib import Path
 
 import numpy as np
 from typing import Any
@@ -40,8 +43,14 @@ from lazy_claude.stdout_guard import get_mcp_stdout  # noqa: E402 (intentional e
 # Default (unset or "0"): wake-word-only mode when a detector is available.
 ENV_LAZY_CLAUDE_ALWAYS_ON = "LAZY_CLAUDE_ALWAYS_ON"
 _VOICE_SUBMIT_KEYWORD_RE = re.compile(r"(?i)\bover\b[\s.!?,:;]*$")
+_VOICE_STOP_KEYWORD_RE = re.compile(r"(?i)^\s*stop(?:\s+stop)*[\s.!?,:;]*$")
 _INITIAL_RESPONSE_TIMEOUT = 60.0
 _CONTINUATION_RESPONSE_TIMEOUT = 3.0
+_CONTINUATION_POLL_INTERVAL = 0.1
+_VOICE_DEVICE_LOCK_PATH = (
+    Path(os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp")
+    / "agent-voice-mcp-device.lock"
+)
 
 
 # All logging goes to stderr.
@@ -53,6 +62,11 @@ def _strip_voice_submit_keyword(text: str) -> tuple[str, bool]:
     """Strip a trailing voice submit keyword such as 'OVER'."""
     stripped = _VOICE_SUBMIT_KEYWORD_RE.sub("", text).strip()
     return stripped, stripped != text.strip()
+
+
+def _is_stop_barge_in(text: str) -> bool:
+    """Return True when a barge-in utterance is an explicit STOP command."""
+    return bool(_VOICE_STOP_KEYWORD_RE.match(text.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +130,38 @@ class VoiceServer:
             self._calibrate_aec()
 
         self.listening: bool = True
-        if self.listening:
-            self._listener.set_active(True)
         self.busy: bool = False
         self._lock = threading.Lock()
+        self._voice_device_lock = threading.Lock()
         _log("VoiceServer ready.")
+
+    def _try_acquire_voice_device(self) -> int | None:
+        """Acquire the shared mic/TTS device lock across processes."""
+        lock_fd = os.open(_VOICE_DEVICE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            return None
+
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"{os.getpid()}\n".encode("utf-8"))
+        os.fsync(lock_fd)
+        return lock_fd
+
+    def _release_voice_device(self, lock_fd: int | None) -> None:
+        """Release a previously acquired shared mic/TTS device lock."""
+        if lock_fd is None:
+            return
+        try:
+            os.ftruncate(lock_fd, 0)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
     def _try_init_macos_backend(self) -> bool:
         """Try to initialise the macOS AVAudioEngine backend.
@@ -237,22 +278,62 @@ class VoiceServer:
     def speak_message_impl(self, *, text: str) -> dict[str, Any]:
         """Speak text via TTS and return a status dict.
 
+        Runs TTS in a background thread and monitors the mic for a "stop"
+        barge-in so the user can interrupt playback mid-sentence.
+
         On macOS path: system AEC handles echo instantly — no sleep or drain.
         On fallback path: wait for echo tail and drain any residual.
         """
         _log(f"speak_message: {len(text)} chars")
-        self._listener.set_tts_playing(True)
-        try:
-            self.tts.speak(text)
-        except Exception as exc:
-            _log(f"WARNING: TTS error during speak_message: {exc}")
-        finally:
-            self._listener.set_tts_playing(False)
+        with self._voice_device_lock:
+            device_fd = self._try_acquire_voice_device()
+            if device_fd is None:
+                _log("speak_message: rejected — voice device busy in another session")
+                return {"status": "busy", "chars": len(text)}
+            try:
+                self._listener.clear_barge_in()
+                self._listener.set_tts_playing(True)
+                self._listener.set_active(True)
 
-        if not self._use_macos_aec:
-            # Fallback path: wait for echo tail to pass, then drain any residual
-            time.sleep(0.8)
-            self._listener.drain_queue()
+                tts_thread = threading.Thread(
+                    target=self._speak_safe, args=(text,), daemon=True
+                )
+                tts_thread.start()
+
+                # Monitor for stop barge-in while TTS plays
+                while tts_thread.is_alive():
+                    pop_barge_in_candidate = getattr(
+                        self._listener, "pop_barge_in_candidate", None
+                    )
+                    if callable(pop_barge_in_candidate):
+                        candidate_audio = pop_barge_in_candidate()
+                        if isinstance(candidate_audio, np.ndarray) and len(candidate_audio) > 0:
+                            _log("Transcribing barge-in candidate during speak_message…")
+                            candidate = transcribe(candidate_audio, model=self._whisper_model)
+                            if (
+                                candidate.no_speech_prob <= 0.6
+                                and _is_stop_barge_in(candidate.text)
+                            ):
+                                _log("STOP barge-in during speak_message — stopping TTS.")
+                                self._listener.barge_in.set()
+                                self.tts.stop()
+                                break
+                    if self._listener.barge_in.is_set():
+                        _log("Barge-in during speak_message — stopping TTS.")
+                        self.tts.stop()
+                        break
+                    time.sleep(0.05)
+
+                tts_thread.join(timeout=2.0)
+                self._listener.set_tts_playing(False)
+                self._listener.set_active(False)
+
+                if not self._use_macos_aec:
+                    # Fallback path: wait for echo tail to pass, then drain any residual
+                    time.sleep(0.8)
+                    self._listener.drain_queue()
+            finally:
+                self._release_voice_device(device_fd)
 
         return {"status": "spoken", "chars": len(text)}
 
@@ -269,11 +350,19 @@ class VoiceServer:
             self.busy = True
 
         try:
-            if self.listening:
-                self._listener.set_active(True)
-            return self._run_qa_session(questions)
+            with self._voice_device_lock:
+                device_fd = self._try_acquire_voice_device()
+                if device_fd is None:
+                    _log("ask_user_voice: rejected — voice device busy in another session")
+                    return "A: (busy — voice device is in use by another session)"
+                try:
+                    if self.listening:
+                        self._listener.set_active(True)
+                    return self._run_qa_session(questions)
+                finally:
+                    self._listener.set_active(False)
+                    self._release_voice_device(device_fd)
         finally:
-            self._listener.set_active(False)
             with self._lock:
                 self.busy = False
 
@@ -283,6 +372,41 @@ class VoiceServer:
             qa = self._ask_single(question)
             parts.append(qa)
         return "\n\n".join(parts)
+
+    def _get_last_input_at(self) -> float | None:
+        getter = getattr(self._listener, "get_last_input_at", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        return value if isinstance(value, (int, float)) else None
+
+    def _wait_for_continuation_speech(self) -> np.ndarray | None:
+        """Wait until 3 seconds after the user's last detected speech frame."""
+        started_waiting_at = time.monotonic()
+        deadline = started_waiting_at + _CONTINUATION_RESPONSE_TIMEOUT
+        last_seen_input_at = self._get_last_input_at()
+
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return None
+
+            timeout = min(_CONTINUATION_POLL_INTERVAL, deadline - now)
+            audio = self._listener.get_next_speech(timeout=timeout)
+            if audio is not None:
+                return audio
+
+            latest_input_at = self._get_last_input_at()
+            if (
+                latest_input_at is not None
+                and latest_input_at > started_waiting_at
+                and (last_seen_input_at is None or latest_input_at > last_seen_input_at)
+            ):
+                last_seen_input_at = latest_input_at
+                deadline = latest_input_at + _CONTINUATION_RESPONSE_TIMEOUT
 
     def _ask_single(self, question: str) -> str:
         """Speak one question via TTS (with barge-in), then transcribe answer.
@@ -309,6 +433,24 @@ class VoiceServer:
 
         # Wait for TTS to finish OR barge-in to fire
         while tts_thread.is_alive():
+            pop_barge_in_candidate = getattr(
+                self._listener,
+                "pop_barge_in_candidate",
+                None,
+            )
+            if callable(pop_barge_in_candidate):
+                candidate_audio = pop_barge_in_candidate()
+                if isinstance(candidate_audio, np.ndarray) and len(candidate_audio) > 0:
+                    _log("Transcribing barge-in candidate…")
+                    candidate = transcribe(candidate_audio, model=self._whisper_model)
+                    if (
+                        candidate.no_speech_prob <= 0.6
+                        and _is_stop_barge_in(candidate.text)
+                    ):
+                        _log("STOP barge-in detected — stopping TTS.")
+                        self._listener.barge_in.set()
+                        self.tts.stop()
+                        break
             if self._listener.barge_in.is_set():
                 _log("Barge-in detected — stopping TTS.")
                 self.tts.stop()
@@ -340,7 +482,10 @@ class VoiceServer:
             else:
                 _log("Waiting for user speech…")
             try:
-                audio = self._listener.get_next_speech(timeout=segment_timeout)
+                if accepted_any_segment:
+                    audio = self._wait_for_continuation_speech()
+                else:
+                    audio = self._listener.get_next_speech(timeout=segment_timeout)
             except Exception as exc:
                 _log(f"ERROR: mic/listener error: {exc}")
                 return f"Q: {question}\nA: (error — mic failed: {exc})"
