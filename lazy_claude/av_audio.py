@@ -50,11 +50,10 @@ except ImportError:  # pragma: no cover
 # Constants
 # ---------------------------------------------------------------------------
 
-_CAPTURE_RATE = 44_100   # AVAudioEngine voice processing requires 44.1 kHz
 _VAD_RATE = 16_000       # Silero VAD expects 16 kHz
 _TTS_RATE = 24_000       # Kokoro outputs 24 kHz
 _VAD_CHUNK = 512         # samples per VAD frame at 16 kHz (32 ms)
-_TAP_BUF_SIZE = 1024     # AVAudioEngine tap request size at 44.1 kHz
+_TAP_BUF_SIZE = 4096     # AVAudioEngine tap request buffer size
 _TAP_QUEUE_MAXSIZE = 128  # bounded queue between CoreAudio callback and consumer
 
 
@@ -214,6 +213,7 @@ class AVAudioBackend:
         self._consumer_thread: Optional[threading.Thread] = None
         self._consumer_stop = threading.Event()
         self._tap_callback: Optional[Callable[[np.ndarray], None]] = None
+        self._actual_capture_rate: int = 48_000  # updated when tap is installed
 
         self._setup_engine()
 
@@ -327,27 +327,29 @@ class AVAudioBackend:
 
         self._tap_callback = callback
 
-        AVFoundation = self._AVFoundation
-        fmt = AVFoundation.AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(
-            AVFoundation.AVAudioPCMFormatFloat32,
-            float(_CAPTURE_RATE),
-            1,  # mono
-            True,
-        )
+        # Query the actual capture rate AFTER voice processing is enabled.
+        # VP can change the input node's format (e.g. 44.1kHz→48kHz, mono→multi-channel).
+        # We pass None as the tap format to use the native format and avoid -10865 errors.
+        vp_fmt = self._input_node.outputFormatForBus_(0)
+        self._actual_capture_rate = int(vp_fmt.sampleRate())
+        _log(f"AVAudioBackend: input node format: {self._actual_capture_rate}Hz, "
+             f"{vp_fmt.channelCount()}ch")
 
         def _tap_block(buffer: Any, when: Any) -> None:
-            """CoreAudio callback — MUST be lightweight."""
+            """CoreAudio callback — MUST be lightweight.
+
+            Extracts channel 0 float data via PyObjC indexing (objc.varlist)
+            and enqueues the numpy array for the consumer thread.
+            """
             try:
-                # Extract float32 pointer from AVAudioPCMBuffer
                 frame_count = buffer.frameLength()
                 channel_data = buffer.floatChannelData()
                 if channel_data is None or frame_count == 0:
                     return
-                # channel_data[0] is a ctypes float pointer
-                ptr = channel_data[0]
-                arr = np.ctypeslib.as_array(
-                    (ctypes.c_float * frame_count).from_address(ctypes.addressof(ptr.contents))
-                ).copy()
+                # channel_data is objc.varlist; channel_data[0] is channel 0 pointer
+                # channel_data[0][i] gives float at index i via PyObjC bridge
+                ch0 = channel_data[0]
+                arr = np.array([ch0[i] for i in range(frame_count)], dtype=np.float32)
                 try:
                     self._tap_queue.put_nowait(arr)
                 except queue.Full:
@@ -355,8 +357,9 @@ class AVAudioBackend:
             except Exception:
                 pass  # never crash in CoreAudio callback
 
+        # None format = use native format (avoids format mismatch errors)
         self._input_node.installTapOnBus_bufferSize_format_block_(
-            0, _TAP_BUF_SIZE, fmt, _tap_block
+            0, _TAP_BUF_SIZE, None, _tap_block
         )
         self._tap_installed = True
 
@@ -379,7 +382,7 @@ class AVAudioBackend:
                 raw = self._tap_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            resampled = resample_audio(raw, _CAPTURE_RATE, _VAD_RATE)
+            resampled = resample_audio(raw, self._actual_capture_rate, _VAD_RATE)
             rechunker.push(resampled)
 
     def remove_mic_tap(self) -> None:
@@ -405,7 +408,7 @@ class AVAudioBackend:
         chunk_24k: np.ndarray,
         completion_handler: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Resample a 24kHz chunk to 44.1kHz and schedule on the player node.
+        """Resample a 24kHz chunk to the engine's output rate and schedule playback.
 
         Non-blocking — returns immediately after scheduling.
 
@@ -422,28 +425,30 @@ class AVAudioBackend:
             return
 
         AVFoundation = self._AVFoundation
-        chunk_44k = resample_audio(chunk_24k, _TTS_RATE, _CAPTURE_RATE)
-        n = len(chunk_44k)
+
+        # Resample to the engine's output rate (usually 44.1kHz or 48kHz)
+        output_rate = int(self._mixer_node.outputFormatForBus_(0).sampleRate())
+        resampled = resample_audio(chunk_24k, _TTS_RATE, output_rate)
+        n = len(resampled)
         if n == 0:
             return
 
+        # Create a mono interleaved buffer at the output rate
         fmt = AVFoundation.AVAudioFormat.alloc().initWithCommonFormat_sampleRate_channels_interleaved_(
             AVFoundation.AVAudioPCMFormatFloat32,
-            float(_CAPTURE_RATE),
+            float(output_rate),
             1,
             True,
         )
         buf = AVFoundation.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(fmt, n)
         buf.setFrameLength_(n)
 
-        # Write samples into the buffer's float channel data
+        # Write samples into the buffer via PyObjC indexing
         try:
             channel_data = buf.floatChannelData()
-            ptr = channel_data[0]
-            dest = np.ctypeslib.as_array(
-                (ctypes.c_float * n).from_address(ctypes.addressof(ptr.contents))
-            )
-            dest[:] = chunk_44k
+            ch0 = channel_data[0]
+            for i in range(n):
+                ch0[i] = float(resampled[i])
         except Exception as exc:
             _log(f"WARNING: could not write to AVAudioPCMBuffer: {exc}")
             return
