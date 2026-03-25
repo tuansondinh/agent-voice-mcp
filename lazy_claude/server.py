@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from io import TextIOWrapper
 from typing import Any
 
@@ -40,7 +41,8 @@ def _log(msg: str) -> None:
 
 from lazy_claude.tts import TTSEngine
 from lazy_claude.stt import load_model, transcribe
-from lazy_claude.audio import load_vad_model, record_audio
+from lazy_claude.audio import load_vad_model, ContinuousListener
+from lazy_claude.aec import ReferenceBuffer, EchoCanceller
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +66,20 @@ class VoiceServer:
 
     def __init__(self) -> None:
         _log("Initialising VoiceServer…")
-        self.tts = TTSEngine()
+
+        # Shared AEC components wired between TTSEngine and ContinuousListener.
+        # The ReferenceBuffer accepts 24kHz from TTS and provides 16kHz to the listener.
+        self._ref_buf = ReferenceBuffer(write_sr=24_000, read_sr=16_000)
+        self._echo_canceller = EchoCanceller()
+
+        self.tts = TTSEngine(ref_buf=self._ref_buf)
         self._whisper_model = load_model()
         self._vad_model = load_vad_model()
+        self._listener = ContinuousListener(
+            self._vad_model,
+            ref_buf=self._ref_buf,
+            echo_canceller=self._echo_canceller,
+        )
 
         self.listening: bool = True
         self.busy: bool = False
@@ -78,13 +91,18 @@ class VoiceServer:
     # ------------------------------------------------------------------
 
     def toggle_listening_impl(self, *, enabled: bool) -> dict[str, Any]:
-        """Enable or disable microphone recording."""
+        """Enable or disable microphone recording (voice mode toggle)."""
         self.listening = enabled
+        self._listener.set_active(enabled)
         _log(f"Listening {'enabled' if enabled else 'disabled'}.")
         return {"listening": enabled}
 
     def speak_message_impl(self, *, text: str) -> dict[str, Any]:
-        """Speak text via TTS and return a status dict."""
+        """Speak text via TTS and return a status dict.
+
+        AEC (via TTSEngine's ref_buf) handles echo suppression — no need to
+        gate the listener here.
+        """
         _log(f"speak_message: {len(text)} chars")
         try:
             self.tts.speak(text)
@@ -118,44 +136,68 @@ class VoiceServer:
         return "\n\n".join(parts)
 
     def _ask_single(self, question: str) -> str:
-        """Speak one question, record response, transcribe, return QA block."""
-        # Step 1 + 2: speak question and wait for TTS to finish
-        _log(f"Speaking question: {question!r}")
-        try:
-            self.tts.speak(question)
-        except Exception as exc:
-            _log(f"WARNING: TTS error while speaking question: {exc}")
+        """Speak one question via TTS (with barge-in), then transcribe answer.
 
-        # Step 3 + 4: listening disabled path — skip mic
+        AEC handles echo suppression — no post-TTS sleep or drain needed.
+        The lightweight _tts_active flag on the listener enables the fallback gate.
+        """
+        _log(f"Speaking question: {question!r}")
+
+        # Prepare listener for this TTS turn
+        self._listener.clear_barge_in()
+        self._listener.set_tts_playing(True)
+
+        # Run TTS in a background thread so barge-in can interrupt it
+        tts_thread = threading.Thread(
+            target=self._speak_safe, args=(question,), daemon=True
+        )
+        tts_thread.start()
+
+        # Wait for TTS to finish OR barge-in to fire
+        while tts_thread.is_alive():
+            if self._listener.barge_in.is_set():
+                _log("Barge-in detected — stopping TTS.")
+                self.tts.stop()
+                break
+            time.sleep(0.05)
+
+        tts_thread.join(timeout=2.0)
+        self._listener.set_tts_playing(False)
+
         if not self.listening:
             _log("Listening disabled — skipping mic recording.")
             return f"Q: {question}\nA: (skipped — listening paused)"
 
-        # Step 3: record audio via VAD
-        _log("Recording answer…")
+        # Wait for the user's spoken response from the always-on listener
+        _log("Waiting for user speech…")
         try:
-            audio = record_audio(vad_model=self._vad_model)
-        except RuntimeError as exc:
-            _log(f"ERROR: mic capture failed: {exc}")
-            return f"Q: {question}\nA: (error — mic failed: {exc})"
+            audio = self._listener.get_next_speech(timeout=60.0)
         except Exception as exc:
-            _log(f"ERROR: unexpected mic error: {exc}")
-            return f"Q: {question}\nA: (error — {exc})"
+            _log(f"ERROR: mic/listener error: {exc}")
+            return f"Q: {question}\nA: (error — mic failed: {exc})"
 
-        # Step 4: handle timeout
         if audio is None:
             _log("No speech detected — timed out.")
             return f"Q: {question}\nA: (no response — timed out)"
 
-        # Step 5: transcribe
         _log("Transcribing…")
         answer = transcribe(audio, model=self._whisper_model)
-
         return f"Q: {question}\nA: {answer}"
+
+    def _speak_safe(self, text: str) -> None:
+        """Run TTS, catching all exceptions so the thread never crashes."""
+        try:
+            self.tts.speak(text)
+        except Exception as exc:
+            _log(f"WARNING: TTS error: {exc}")
 
     def shutdown(self) -> None:
         """Release resources on server stop."""
         _log("VoiceServer shutting down…")
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
         try:
             self.tts.stop()
         except Exception:

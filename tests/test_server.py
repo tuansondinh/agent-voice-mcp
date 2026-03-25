@@ -9,11 +9,11 @@ client.  They verify:
 - toggle_listening returns correct dict
 - speak_message returns correct dict
 - ask_user_voice skips recording when listening is disabled (returns skipped message)
-- ask_user_voice returns timeout message when record_audio returns None
+- ask_user_voice returns timeout message when get_next_speech returns None
 - ask_user_voice returns formatted Q/A string when transcription succeeds
 - ask_user_voice handles multiple questions in sequence
 - Concurrent call protection: second call raises/returns busy message
-- Graceful mic error handling: RuntimeError from record_audio returns error text
+- Graceful mic error handling: RuntimeError from get_next_speech returns error text
 """
 
 from __future__ import annotations
@@ -38,15 +38,40 @@ def _make_mock_tts():
     return mock
 
 
-def _make_mock_audio(return_value=None):
-    """Return a mock record_audio function."""
-    mock = MagicMock(return_value=return_value)
-    return mock
-
-
 def _make_mock_transcribe(return_value="hello world"):
     """Return a mock transcribe function."""
     return MagicMock(return_value=return_value)
+
+
+def _make_mock_listener(next_speech=None):
+    """Return a mock ContinuousListener."""
+    mock = MagicMock()
+    mock.barge_in = threading.Event()
+    mock.get_next_speech = MagicMock(return_value=next_speech)
+    mock.set_active = MagicMock()
+    mock.set_tts_playing = MagicMock()
+    mock.clear_barge_in = MagicMock()
+    mock.drain_queue = MagicMock()
+    return mock
+
+
+def _make_server(mock_tts=None, next_speech=None):
+    """Build a VoiceServer with all heavy deps mocked."""
+    if mock_tts is None:
+        mock_tts = _make_mock_tts()
+    mock_listener = _make_mock_listener(next_speech=next_speech)
+    with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
+         patch('lazy_claude.server.load_model', return_value=MagicMock()), \
+         patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
+         patch('lazy_claude.server.ReferenceBuffer'), \
+         patch('lazy_claude.server.EchoCanceller'), \
+         patch('lazy_claude.server.ContinuousListener', return_value=mock_listener):
+        from lazy_claude.server import VoiceServer
+        s = VoiceServer()
+    s.tts = mock_tts
+    # Ensure the mock listener is directly accessible
+    s._listener = mock_listener
+    return s, mock_tts, mock_listener
 
 
 # ---------------------------------------------------------------------------
@@ -74,23 +99,16 @@ class TestServerImport:
 
 
 class TestVoiceServerInit:
-    def _make_server(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            return VoiceServer()
-
     def test_server_creates_without_error(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         assert server is not None
 
     def test_listening_enabled_by_default(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         assert server.listening is True
 
     def test_busy_flag_false_by_default(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         assert server.busy is False
 
 
@@ -100,30 +118,23 @@ class TestVoiceServerInit:
 
 
 class TestToggleListening:
-    def _make_server(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            return VoiceServer()
-
     def test_toggle_off_returns_dict(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         result = server.toggle_listening_impl(enabled=False)
         assert result == {"listening": False}
 
     def test_toggle_on_returns_dict(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         result = server.toggle_listening_impl(enabled=True)
         assert result == {"listening": True}
 
     def test_toggle_off_sets_listening_false(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         server.toggle_listening_impl(enabled=False)
         assert server.listening is False
 
     def test_toggle_on_sets_listening_true(self):
-        server = self._make_server()
+        server, _, _ = _make_server()
         server.toggle_listening_impl(enabled=False)
         server.toggle_listening_impl(enabled=True)
         assert server.listening is True
@@ -135,37 +146,33 @@ class TestToggleListening:
 
 
 class TestSpeakMessage:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
     def test_speak_message_returns_correct_dict(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, _ = _make_server()
         result = server.speak_message_impl(text="Hello world")
         assert result == {"status": "spoken", "chars": 11}
 
     def test_speak_message_calls_tts_speak(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, _ = _make_server()
         server.speak_message_impl(text="Hi there")
         mock_tts.speak.assert_called_once_with("Hi there")
 
     def test_speak_message_empty_string(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, _ = _make_server()
         result = server.speak_message_impl(text="")
         assert result["chars"] == 0
         assert result["status"] == "spoken"
 
     def test_speak_message_returns_char_count(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, _ = _make_server()
         text = "A" * 50
         result = server.speak_message_impl(text=text)
         assert result["chars"] == 50
+
+    def test_speak_message_does_not_call_set_tts_playing(self):
+        """speak_message_impl must NOT call set_tts_playing (AEC handles echo)."""
+        server, mock_tts, mock_listener = _make_server()
+        server.speak_message_impl(text="Hello")
+        mock_listener.set_tts_playing.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -174,62 +181,40 @@ class TestSpeakMessage:
 
 
 class TestAskUserVoiceListeningDisabled:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
     def test_skips_recording_when_disabled(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, mock_listener = _make_server()
         server.toggle_listening_impl(enabled=False)
-        with patch('lazy_claude.server.record_audio') as mock_record:
-            result = server.ask_user_voice_impl(questions=["What is your name?"])
-        mock_record.assert_not_called()
+        result = server.ask_user_voice_impl(questions=["What is your name?"])
+        # get_next_speech should never be called when listening is off
+        mock_listener.get_next_speech.assert_not_called()
 
     def test_returns_skipped_message_when_disabled(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, mock_listener = _make_server()
         server.toggle_listening_impl(enabled=False)
         result = server.ask_user_voice_impl(questions=["What is your name?"])
         assert "skipped" in result.lower() or "listening paused" in result.lower()
 
     def test_still_speaks_question_when_disabled(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, mock_listener = _make_server()
         server.toggle_listening_impl(enabled=False)
-        result = server.ask_user_voice_impl(questions=["Are you ready?"])
+        server.ask_user_voice_impl(questions=["Are you ready?"])
         mock_tts.speak.assert_called()
 
 
 # ---------------------------------------------------------------------------
-# ask_user_voice — timeout (record_audio returns None)
+# ask_user_voice — timeout (get_next_speech returns None)
 # ---------------------------------------------------------------------------
 
 
 class TestAskUserVoiceTimeout:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
     def test_returns_timed_out_message(self):
-        server, mock_tts = self._make_server()
-        with patch('lazy_claude.server.record_audio', return_value=None):
-            result = server.ask_user_voice_impl(questions=["Hello?"])
+        server, mock_tts, mock_listener = _make_server(next_speech=None)
+        result = server.ask_user_voice_impl(questions=["Hello?"])
         assert "timed out" in result.lower() or "no response" in result.lower()
 
     def test_result_contains_question(self):
-        server, mock_tts = self._make_server()
-        with patch('lazy_claude.server.record_audio', return_value=None):
-            result = server.ask_user_voice_impl(questions=["What time is it?"])
+        server, mock_tts, mock_listener = _make_server(next_speech=None)
+        result = server.ask_user_voice_impl(questions=["What time is it?"])
         assert "What time is it?" in result
 
 
@@ -239,31 +224,20 @@ class TestAskUserVoiceTimeout:
 
 
 class TestAskUserVoiceSuccess:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
     def _dummy_audio(self):
         return np.zeros(16_000, dtype=np.float32)
 
     def test_returns_formatted_qa_string(self):
-        server, mock_tts = self._make_server()
         audio = self._dummy_audio()
-        with patch('lazy_claude.server.record_audio', return_value=audio), \
-             patch('lazy_claude.server.transcribe', return_value="I am fine"):
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        with patch('lazy_claude.server.transcribe', return_value="I am fine"):
             result = server.ask_user_voice_impl(questions=["How are you?"])
         assert "Q: How are you?" in result
         assert "A: I am fine" in result
 
     def test_multiple_questions_all_in_result(self):
-        server, mock_tts = self._make_server()
         audio = self._dummy_audio()
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
         answers = ["Paris", "42"]
         call_count = [0]
 
@@ -272,8 +246,7 @@ class TestAskUserVoiceSuccess:
             call_count[0] += 1
             return answers[idx]
 
-        with patch('lazy_claude.server.record_audio', return_value=audio), \
-             patch('lazy_claude.server.transcribe', side_effect=mock_transcribe):
+        with patch('lazy_claude.server.transcribe', side_effect=mock_transcribe):
             result = server.ask_user_voice_impl(
                 questions=["Capital of France?", "Answer to everything?"]
             )
@@ -284,51 +257,39 @@ class TestAskUserVoiceSuccess:
 
     def test_empty_transcription_returned_verbatim(self):
         """Empty transcription should still be returned, not dropped."""
-        server, mock_tts = self._make_server()
         audio = self._dummy_audio()
-        with patch('lazy_claude.server.record_audio', return_value=audio), \
-             patch('lazy_claude.server.transcribe', return_value=""):
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        with patch('lazy_claude.server.transcribe', return_value=""):
             result = server.ask_user_voice_impl(questions=["Say something?"])
         assert "Q: Say something?" in result
         assert "A:" in result
 
     def test_tts_speak_called_for_each_question(self):
-        server, mock_tts = self._make_server()
         audio = self._dummy_audio()
-        with patch('lazy_claude.server.record_audio', return_value=audio), \
-             patch('lazy_claude.server.transcribe', return_value="yes"):
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        with patch('lazy_claude.server.transcribe', return_value="yes"):
             server.ask_user_voice_impl(questions=["Q1?", "Q2?", "Q3?"])
         assert mock_tts.speak.call_count == 3
 
 
 # ---------------------------------------------------------------------------
-# ask_user_voice — mic error handling
+# ask_user_voice — mic / listener error handling
 # ---------------------------------------------------------------------------
 
 
 class TestAskUserVoiceMicError:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
-    def test_mic_error_returns_error_text_not_crash(self):
-        server, mock_tts = self._make_server()
-        with patch('lazy_claude.server.record_audio', side_effect=RuntimeError("mic denied")):
-            result = server.ask_user_voice_impl(questions=["Hello?"])
+    def test_get_next_speech_exception_returns_error_text_not_crash(self):
+        server, mock_tts, mock_listener = _make_server()
+        mock_listener.get_next_speech.side_effect = RuntimeError("mic denied")
+        result = server.ask_user_voice_impl(questions=["Hello?"])
         # Should return something with error info, not raise
         assert result is not None
         assert isinstance(result, str)
 
-    def test_mic_error_result_contains_error_indicator(self):
-        server, mock_tts = self._make_server()
-        with patch('lazy_claude.server.record_audio', side_effect=RuntimeError("no mic")):
-            result = server.ask_user_voice_impl(questions=["Test?"])
+    def test_get_next_speech_exception_result_contains_error_indicator(self):
+        server, mock_tts, mock_listener = _make_server()
+        mock_listener.get_next_speech.side_effect = RuntimeError("no mic")
+        result = server.ask_user_voice_impl(questions=["Test?"])
         assert "error" in result.lower() or "mic" in result.lower() or "failed" in result.lower()
 
 
@@ -338,28 +299,17 @@ class TestAskUserVoiceMicError:
 
 
 class TestConcurrentCallProtection:
-    def _make_server(self):
-        mock_tts = _make_mock_tts()
-        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
-             patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
-            from lazy_claude.server import VoiceServer
-            s = VoiceServer()
-        s.tts = mock_tts
-        return s, mock_tts
-
     def test_busy_flag_rejects_concurrent_call(self):
-        server, mock_tts = self._make_server()
+        server, mock_tts, mock_listener = _make_server()
         # Simulate server is already busy
         server.busy = True
         result = server.ask_user_voice_impl(questions=["Are you busy?"])
         assert "busy" in result.lower() or "processing" in result.lower()
 
     def test_busy_flag_cleared_after_call(self):
-        server, mock_tts = self._make_server()
         audio = np.zeros(16_000, dtype=np.float32)
-        with patch('lazy_claude.server.record_audio', return_value=audio), \
-             patch('lazy_claude.server.transcribe', return_value="ok"):
+        server, mock_tts, mock_listener = _make_server(next_speech=audio)
+        with patch('lazy_claude.server.transcribe', return_value="ok"):
             server.ask_user_voice_impl(questions=["Test?"])
         assert server.busy is False
 
@@ -371,36 +321,52 @@ class TestConcurrentCallProtection:
 
 class TestMCPToolRegistration:
     def test_create_server_returns_fastmcp_app(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
+        mock_tts = _make_mock_tts()
+        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
              patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
+             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
+             patch('lazy_claude.server.ReferenceBuffer'), \
+             patch('lazy_claude.server.EchoCanceller'), \
+             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
             from lazy_claude.server import create_server
             from mcp.server.fastmcp import FastMCP
             app, voice = create_server()
         assert isinstance(app, FastMCP)
 
     def test_ask_user_voice_tool_registered(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
+        mock_tts = _make_mock_tts()
+        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
              patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
+             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
+             patch('lazy_claude.server.ReferenceBuffer'), \
+             patch('lazy_claude.server.EchoCanceller'), \
+             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
             from lazy_claude.server import create_server
             app, voice = create_server()
         tool_names = [t.name for t in asyncio.run(app.list_tools())]
         assert "ask_user_voice" in tool_names
 
     def test_speak_message_tool_registered(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
+        mock_tts = _make_mock_tts()
+        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
              patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
+             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
+             patch('lazy_claude.server.ReferenceBuffer'), \
+             patch('lazy_claude.server.EchoCanceller'), \
+             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
             from lazy_claude.server import create_server
             app, voice = create_server()
         tool_names = [t.name for t in asyncio.run(app.list_tools())]
         assert "speak_message" in tool_names
 
     def test_toggle_listening_tool_registered(self):
-        with patch('lazy_claude.server.TTSEngine', return_value=_make_mock_tts()), \
+        mock_tts = _make_mock_tts()
+        with patch('lazy_claude.server.TTSEngine', return_value=mock_tts), \
              patch('lazy_claude.server.load_model', return_value=MagicMock()), \
-             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()):
+             patch('lazy_claude.server.load_vad_model', return_value=MagicMock()), \
+             patch('lazy_claude.server.ReferenceBuffer'), \
+             patch('lazy_claude.server.EchoCanceller'), \
+             patch('lazy_claude.server.ContinuousListener', return_value=_make_mock_listener()):
             from lazy_claude.server import create_server
             app, voice = create_server()
         tool_names = [t.name for t in asyncio.run(app.list_tools())]

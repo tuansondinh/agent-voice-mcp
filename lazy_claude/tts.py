@@ -59,6 +59,11 @@ _SAMPLE_RATE = 24_000        # Hz — Kokoro outputs 24 kHz audio
 _VOICE = 'af_heart'          # Default voice
 _REPO_ID = 'hexgrad/Kokoro-82M'
 
+# Type alias for ReferenceBuffer — imported lazily to avoid circular deps
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from lazy_claude.aec import ReferenceBuffer
+
 
 # ---------------------------------------------------------------------------
 # Logging helper
@@ -83,7 +88,15 @@ class TTSEngine:
         engine.stop()   # interrupt if still speaking
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ref_buf: "ReferenceBuffer | None" = None) -> None:
+        """
+        Parameters
+        ----------
+        ref_buf:
+            Optional ReferenceBuffer shared with ContinuousListener for AEC.
+            When provided, each synthesised audio chunk is also written into
+            the buffer so the echo canceller can use it as a reference signal.
+        """
         # Initialise Kokoro pipeline
         self._pipeline = KPipeline(lang_code='a', repo_id=_REPO_ID)
 
@@ -98,6 +111,9 @@ class TTSEngine:
                 "will resample in software."
             )
             self._needs_resample = True
+
+        # Shared AEC reference buffer (optional)
+        self._ref_buf = ref_buf
 
         # Playback state
         self._speaking = False
@@ -184,6 +200,13 @@ class TTSEngine:
 
                     # sounddevice OutputStream.write expects shape (frames, channels)
                     stream.write(chunk.reshape(-1, 1))
+
+                    # Push raw chunk (before any resampling change) into AEC reference
+                    # buffer so the echo canceller can subtract the speaker signal.
+                    # We push the flat float32 chunk at _SAMPLE_RATE (24 kHz); the
+                    # ReferenceBuffer handles 24k→16k resampling internally.
+                    if self._ref_buf is not None:
+                        self._ref_buf.write(chunk)
 
                     if self._stop_event.is_set():
                         break

@@ -21,12 +21,13 @@ VadStateMachine
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 
@@ -423,3 +424,285 @@ def record_audio(
     audio = np.concatenate(recorded_chunks)
     _log(f"Captured {len(audio) / SAMPLE_RATE:.2f}s of audio.")
     return audio.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# ContinuousListener — always-on mic with barge-in support
+# ---------------------------------------------------------------------------
+
+class ContinuousListener:
+    """Always-on microphone that queues user speech as numpy arrays.
+
+    Runs a persistent background thread.  When AEC is active (ref_buf and
+    echo_canceller provided), each mic frame is echo-cancelled before being
+    passed to the VAD.  Barge-in is detected when VAD fires on the cleaned
+    signal during TTS.  A soft fallback gate suppresses residual echo that
+    slips through AEC (high residual energy during TTS).
+
+    Usage::
+
+        from lazy_claude.aec import ReferenceBuffer, EchoCanceller
+        ref_buf = ReferenceBuffer()
+        ec = EchoCanceller()
+        listener = ContinuousListener(vad_model, ref_buf=ref_buf, echo_canceller=ec)
+        audio = listener.get_next_speech(timeout=60.0)
+        listener.stop()
+    """
+
+    # VAD probability threshold (unified — applies to both normal and barge-in detection)
+    NORMAL_THRESHOLD: float = 0.5
+    BARGE_IN_FRAMES: int = 3            # consecutive high-prob frames to confirm barge-in
+
+    # Utterance segmentation
+    SILENCE_DURATION: float = 1.5       # seconds of trailing silence to stop
+    MIN_SPEECH_DURATION: float = 0.5    # minimum speech before a stop is honoured
+
+    # Fallback gate: if AEC residual RMS power exceeds this during TTS → suppress chunk.
+    # Acts as a safety net when the adaptive filter has not yet converged.
+    # Power is mean of squared samples. 0.01 ≈ -40 dBFS (RMS ~0.1).
+    AEC_RESIDUAL_GATE_THRESHOLD: float = 0.01
+
+    def __init__(
+        self,
+        vad_model: SileroVAD,
+        ref_buf: "Optional[Any]" = None,
+        echo_canceller: "Optional[Any]" = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        vad_model:
+            Loaded SileroVAD instance.
+        ref_buf:
+            Optional ReferenceBuffer shared with TTSEngine.  When provided,
+            the mic callback reads reference samples from it and passes them
+            to the echo_canceller.
+        echo_canceller:
+            Optional EchoCanceller instance.  Used together with ref_buf to
+            subtract the TTS speaker signal from the mic signal before VAD.
+        """
+        self._vad = vad_model
+        self._ref_buf = ref_buf
+        self._echo_canceller = echo_canceller
+        self._speech_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._barge_in_event = threading.Event()
+        self._stop_event = threading.Event()
+        # Lightweight flag: True while TTS is playing (used for fallback gate only)
+        self._tts_active: bool = False
+        # threading.Event: set = voice mode active (mic collects speech)
+        self._active = threading.Event()
+
+        # Per-utterance mutable state (written only by the mic callback thread)
+        self._recording: bool = False
+        self._utterance_chunks: list[np.ndarray] = []
+        self._accumulated_speech: float = 0.0
+        self._silence_started: float | None = None
+        self._barge_in_frame_count: int = 0
+
+        # Callback reference — set by _run() once the capture rate is known.
+        # Exposed so tests can invoke the callback directly without starting audio.
+        self._callback: "Optional[Any]" = None
+
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="continuous-listener"
+        )
+        self._thread.start()
+        _log("ContinuousListener started (inactive until voice mode enabled).")
+
+    # ------------------------------------------------------------------
+    # Public API (thread-safe)
+    # ------------------------------------------------------------------
+
+    def set_active(self, active: bool) -> None:
+        """Enable or disable speech collection (voice mode toggle).
+
+        When inactive the background mic thread keeps running but discards
+        all audio — no utterances are queued and barge-in is suppressed.
+        Call set_active(True) to re-enable collection.
+        """
+        if active:
+            self.drain_queue()
+            self._active.set()
+            _log("ContinuousListener: voice mode ON.")
+        else:
+            self._active.clear()
+            self.drain_queue()
+            _log("ContinuousListener: voice mode OFF.")
+
+    @property
+    def is_active(self) -> bool:
+        return self._active.is_set()
+
+    def set_tts_playing(self, playing: bool) -> None:
+        """Set the lightweight TTS-active flag used by the fallback gate.
+
+        This is a thin flag only — AEC handles the main echo suppression.
+        """
+        self._tts_active = playing
+
+    def clear_barge_in(self) -> None:
+        """Reset the barge-in flag before a new TTS turn."""
+        self._barge_in_event.clear()
+
+    @property
+    def barge_in(self) -> threading.Event:
+        """Event that is set when barge-in speech is detected during TTS."""
+        return self._barge_in_event
+
+    def get_next_speech(self, timeout: float = 60.0) -> "np.ndarray | None":
+        """Block until the next user utterance arrives, or *timeout* seconds.
+
+        Returns a 16 kHz mono float32 array, or None on timeout.
+        """
+        try:
+            return self._speech_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def drain_queue(self) -> None:
+        """Discard all pending speech (e.g. TTS echo that slipped through)."""
+        while not self._speech_queue.empty():
+            try:
+                self._speech_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def stop(self) -> None:
+        """Stop the background listener thread."""
+        self._stop_event.set()
+        _log("ContinuousListener stop requested.")
+
+    # ------------------------------------------------------------------
+    # Background thread
+    # ------------------------------------------------------------------
+
+    def _make_callback(self, capture_rate: int, needs_resample: bool):
+        """Build and store the sounddevice callback, returning it.
+
+        Split out from _run() so tests can call self._callback directly
+        without needing audio hardware.
+        """
+        chunk_duration = CHUNK_SAMPLES / SAMPLE_RATE  # seconds per VAD chunk
+
+        def _callback(
+            indata: np.ndarray, frames: int, _time_info, status
+        ) -> None:
+            # Drop all audio when voice mode is inactive
+            if not self._active.is_set():
+                return
+
+            mono = indata[:, 0].copy()
+            chunk_16k = _resample_to_16k(mono, capture_rate) if needs_resample else mono
+
+            # Guard: VAD model expects exactly CHUNK_SAMPLES frames
+            if len(chunk_16k) != CHUNK_SAMPLES:
+                return
+
+            # ── AEC: pull reference and cancel echo ──
+            if self._ref_buf is not None and self._echo_canceller is not None:
+                ref_chunk = self._ref_buf.read(CHUNK_SAMPLES)
+                processed = self._echo_canceller.cancel(chunk_16k, ref_chunk)
+            else:
+                processed = chunk_16k
+
+            tts_active = self._tts_active
+
+            # ── Fallback gate: suppress if AEC residual energy is too high during TTS ──
+            # This catches cases where the adaptive filter has not yet converged.
+            if tts_active:
+                residual_power = float(np.mean(processed.astype(np.float64) ** 2))
+                if residual_power > self.AEC_RESIDUAL_GATE_THRESHOLD:
+                    # Echo leaked through — discard chunk; decay barge-in counter
+                    self._barge_in_frame_count = max(0, self._barge_in_frame_count - 1)
+                    return
+
+            prob = self._vad(processed)
+            now = time.monotonic()
+
+            if tts_active:
+                # ── TTS playing: barge-in detection on cleaned signal ──
+                # Use the same NORMAL_THRESHOLD — AEC has already attenuated echo.
+                if prob >= self.NORMAL_THRESHOLD:
+                    self._barge_in_frame_count += 1
+                    if self._barge_in_frame_count >= self.BARGE_IN_FRAMES:
+                        # Confirmed barge-in: raise event and switch to record
+                        self._barge_in_event.set()
+                        self._tts_active = False   # clear TTS flag
+                        self._barge_in_frame_count = 0
+                        # Start capturing the barge-in utterance
+                        self._recording = True
+                        self._accumulated_speech = chunk_duration
+                        self._silence_started = None
+                        self._utterance_chunks = [processed]
+                else:
+                    self._barge_in_frame_count = max(0, self._barge_in_frame_count - 1)
+                return  # discard chunk (still in TTS, barge-in handled above)
+
+            # ── Normal listening ──
+            self._barge_in_frame_count = 0
+            is_speech = prob >= self.NORMAL_THRESHOLD
+
+            if not self._recording:
+                if is_speech:
+                    self._recording = True
+                    self._accumulated_speech = chunk_duration
+                    self._silence_started = None
+                    self._utterance_chunks = [processed]
+            else:
+                self._utterance_chunks.append(processed)
+                if is_speech:
+                    self._accumulated_speech += chunk_duration
+                    self._silence_started = None
+                else:
+                    if self._silence_started is None:
+                        self._silence_started = now
+                    elif (
+                        now - self._silence_started >= self.SILENCE_DURATION
+                        and self._accumulated_speech >= self.MIN_SPEECH_DURATION
+                    ):
+                        # Utterance complete — enqueue it
+                        audio = np.concatenate(self._utterance_chunks)
+                        self._speech_queue.put(audio.astype(np.float32))
+                        _log(
+                            f"ContinuousListener: queued "
+                            f"{len(audio) / SAMPLE_RATE:.2f}s utterance."
+                        )
+                        self._recording = False
+                        self._utterance_chunks = []
+                        self._accumulated_speech = 0.0
+                        self._silence_started = None
+
+        self._callback = _callback
+        return _callback
+
+    def _run(self) -> None:
+        import sounddevice as sd  # noqa: PLC0415
+
+        try:
+            capture_rate, needs_resample = _get_capture_rate()
+        except Exception as exc:
+            _log(f"ERROR: ContinuousListener could not query audio device: {exc}")
+            return
+
+        native_chunk = CHUNK_SAMPLES if not needs_resample else int(
+            CHUNK_SAMPLES * capture_rate / SAMPLE_RATE
+        )
+
+        callback = self._make_callback(capture_rate, needs_resample)
+
+        try:
+            with sd.InputStream(
+                samplerate=capture_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=native_chunk,
+                callback=callback,
+            ):
+                _log("ContinuousListener: mic open.")
+                self._stop_event.wait()
+        except sd.PortAudioError as exc:
+            _log(f"ERROR: ContinuousListener PortAudio: {exc}")
+        except Exception as exc:
+            _log(f"ERROR: ContinuousListener unexpected: {exc}")
+        finally:
+            _log("ContinuousListener: mic closed.")
