@@ -1,5 +1,5 @@
 {
-  "name": "@tuan_son.dinh/agent-voice-mcp",
+  "name": "@tuan_son.dinh/agent-voice",
   "version": "0.1.2",
   "description": "Turn-based voice MCP server for Claude Code and Codex",
   "main": "bin/claude-voice.js",

@@ -125,22 +125,6 @@ class TestVADStateMachine:
 # ---------------------------------------------------------------------------
 
 
-class TestAudioModuleAPI:
-    """Verify the public API surface of audio.py."""
-
-    def test_record_audio_callable(self):
-        from lazy_claude.audio import record_audio
-        assert callable(record_audio)
-
-    def test_vad_model_loader_callable(self):
-        from lazy_claude.audio import load_vad_model
-        assert callable(load_vad_model)
-
-    def test_vad_state_machine_importable(self):
-        from lazy_claude.audio import VadStateMachine
-        assert VadStateMachine is not None
-
-
 class TestVADModelLoading:
     """Test that the Silero VAD ONNX model can be loaded and run on a dummy chunk."""
 

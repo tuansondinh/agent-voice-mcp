@@ -476,6 +476,8 @@ class TestMacOSTTSEngineAPI:
             engine._backend = mock_backend
             engine._speaking = False
             engine._stop_event = threading.Event()
+            engine._use_kokoro = True   # default: Kokoro path
+            engine._language = 'en'
         return engine, mock_pipeline, mock_backend
 
     def test_speak_empty_text_is_noop(self):
@@ -504,6 +506,8 @@ class TestMacOSTTSEngineAPI:
             engine._backend = mock_backend
             engine._speaking = False
             engine._stop_event = threading.Event()
+            engine._use_kokoro = True   # Kokoro path for this test
+            engine._language = 'en'
             engine.speak("hello")
 
         mock_backend.play_audio.assert_called_once()

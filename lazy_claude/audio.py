@@ -505,6 +505,7 @@ class ContinuousListener:
         self._barge_in_candidate: "np.ndarray | None" = None
         self._barge_in_event = threading.Event()
         self._stop_event = threading.Event()
+        self._stream_state_changed = threading.Event()
         # Lightweight flag: True while TTS is playing (used for fallback gate only)
         self._tts_active: bool = False
         # Timestamp when TTS stopped — used for post-TTS echo tail
@@ -618,12 +619,14 @@ class ContinuousListener:
         if active:
             self.drain_queue()
             self._active.set()
+            self._stream_state_changed.set()
             _log("ContinuousListener: voice mode ON.")
         else:
             self._active.clear()
             self._reset_utterance_state()
             self._reset_barge_in_state()
             self.drain_queue()
+            self._stream_state_changed.set()
             # On deactivation, return to wake_word mode if wake-word detection is available
             if getattr(self, '_porcupine', None) is not None:
                 self._mode = "wake_word"
@@ -691,6 +694,7 @@ class ContinuousListener:
     def stop(self) -> None:
         """Stop the background listener thread."""
         self._stop_event.set()
+        self._stream_state_changed.set()
         if getattr(self, '_porcupine', None) is not None:
             try:
                 self._porcupine.delete()
@@ -905,6 +909,11 @@ class ContinuousListener:
         import sounddevice as sd  # noqa: PLC0415
 
         while not self._stop_event.is_set():
+            if not self._active.is_set():
+                self._stream_state_changed.wait(timeout=0.5)
+                self._stream_state_changed.clear()
+                continue
+
             try:
                 capture_rate, needs_resample = _get_capture_rate()
             except Exception as exc:
@@ -929,10 +938,14 @@ class ContinuousListener:
                     _log("ContinuousListener: mic open.")
                     # Poll for stop or device change
                     while not self._stop_event.is_set():
+                        if not self._active.is_set():
+                            _log("ContinuousListener: voice mode OFF — closing mic.")
+                            break
                         if self._device_changed:
                             _log("ContinuousListener: device change — restarting stream.")
                             break
-                        self._stop_event.wait(timeout=0.5)
+                        self._stream_state_changed.wait(timeout=0.5)
+                        self._stream_state_changed.clear()
             except sd.PortAudioError as exc:
                 _log(f"ERROR: ContinuousListener PortAudio: {exc}")
                 # If a device error occurs, treat it as a device change and retry

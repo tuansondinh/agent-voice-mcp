@@ -38,23 +38,6 @@ def _noise(seconds: float = 0.5) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# API surface
-# ---------------------------------------------------------------------------
-
-
-class TestSTTModuleAPI:
-    """Verify the public API of stt.py exists and is callable."""
-
-    def test_transcribe_callable(self):
-        from lazy_claude.stt import transcribe
-        assert callable(transcribe)
-
-    def test_load_model_callable(self):
-        from lazy_claude.stt import load_model
-        assert callable(load_model)
-
-
-# ---------------------------------------------------------------------------
 # Empty / silent audio
 # ---------------------------------------------------------------------------
 

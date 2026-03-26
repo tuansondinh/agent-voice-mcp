@@ -39,20 +39,6 @@ def _rms_db(signal: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Import smoke test
-# ---------------------------------------------------------------------------
-
-class TestImport:
-    def test_echo_canceller_importable(self):
-        from lazy_claude.aec import EchoCanceller
-        assert EchoCanceller is not None
-
-    def test_reference_buffer_importable(self):
-        from lazy_claude.aec import ReferenceBuffer
-        assert ReferenceBuffer is not None
-
-
-# ---------------------------------------------------------------------------
 # EchoCanceller basic API
 # ---------------------------------------------------------------------------
 

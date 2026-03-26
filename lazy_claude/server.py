@@ -42,6 +42,8 @@ from lazy_claude.stdout_guard import get_mcp_stdout  # noqa: E402 (intentional e
 # Set to "1" to keep the mic always-on even when wake-word detection is configured.
 # Default (unset or "0"): wake-word-only mode when a detector is available.
 ENV_LAZY_CLAUDE_ALWAYS_ON = "LAZY_CLAUDE_ALWAYS_ON"
+# BCP-47 language tag for TTS + STT, e.g. "en" (default) or "de".
+ENV_LAZY_CLAUDE_LANGUAGE = "LAZY_CLAUDE_LANGUAGE"
 _VOICE_SUBMIT_KEYWORD_RE = re.compile(r"(?i)\bover\b[\s.!?,:;]*$")
 _VOICE_STOP_KEYWORD_RE = re.compile(r"(?i)\bstop\b")
 _VOICE_STOP_EXCLUDED_PHRASE_RE = re.compile(
@@ -82,7 +84,7 @@ def _is_stop_barge_in(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 from lazy_claude.tts import TTSEngine
-from lazy_claude.stt import load_model, transcribe
+from lazy_claude.stt import load_model, transcribe, model_name_for_language
 from lazy_claude.audio import load_vad_model, ContinuousListener
 from lazy_claude.aec import ReferenceBuffer, EchoCanceller
 
@@ -112,6 +114,11 @@ class VoiceServer:
     def __init__(self) -> None:
         _log("Initialising VoiceServer…")
 
+        # Read language setting (e.g. LAZY_CLAUDE_LANGUAGE=de for German)
+        self._language: str = os.environ.get(ENV_LAZY_CLAUDE_LANGUAGE, 'en').lower()
+        if self._language != 'en':
+            _log(f"Language override: '{self._language}'")
+
         self._use_macos_aec: bool = False
 
         # --- Attempt macOS AVAudioEngine backend ---
@@ -126,8 +133,9 @@ class VoiceServer:
                 mu=0.4,
                 enable_res=True,
             )
-            self.tts = TTSEngine(ref_buf=self._ref_buf)
-            self._whisper_model = load_model()
+            self.tts = TTSEngine(ref_buf=self._ref_buf, language=self._language)
+            whisper_model_name = model_name_for_language(self._language)
+            self._whisper_model = load_model(whisper_model_name)
             self._vad_model = load_vad_model()
             self._listener = ContinuousListener(
                 self._vad_model,
@@ -193,12 +201,13 @@ class VoiceServer:
             shared_backend = AVAudioBackend()
 
             # Whisper model (needed for STT regardless of audio backend)
-            self._whisper_model = load_model()
+            whisper_model_name = model_name_for_language(self._language)
+            self._whisper_model = load_model(whisper_model_name)
             self._vad_model = load_vad_model()
 
             # Instantiate macOS-native listener and TTS, both sharing the same backend.
             self._listener = MacOSContinuousListener(self._vad_model, backend=shared_backend)
-            self.tts = MacOSTTSEngine(backend=shared_backend)
+            self.tts = MacOSTTSEngine(backend=shared_backend, language=self._language)
 
             _log("Using macOS AVAudioEngine backend with system AEC.")
             return True
@@ -319,7 +328,7 @@ class VoiceServer:
                         candidate_audio = pop_barge_in_candidate()
                         if isinstance(candidate_audio, np.ndarray) and len(candidate_audio) > 0:
                             _log("Transcribing barge-in candidate during speak_message…")
-                            candidate = transcribe(candidate_audio, model=self._whisper_model)
+                            candidate = transcribe(candidate_audio, model=self._whisper_model, language=self._language)
                             if (
                                 candidate.no_speech_prob <= 0.6
                                 and _is_stop_barge_in(candidate.text)
@@ -452,7 +461,7 @@ class VoiceServer:
                 candidate_audio = pop_barge_in_candidate()
                 if isinstance(candidate_audio, np.ndarray) and len(candidate_audio) > 0:
                     _log("Transcribing barge-in candidate…")
-                    candidate = transcribe(candidate_audio, model=self._whisper_model)
+                    candidate = transcribe(candidate_audio, model=self._whisper_model, language=self._language)
                     if (
                         candidate.no_speech_prob <= 0.6
                         and _is_stop_barge_in(candidate.text)
@@ -513,7 +522,7 @@ class VoiceServer:
             self._listener.drain_queue()
 
             _log("Transcribing…")
-            result = transcribe(audio, model=self._whisper_model)
+            result = transcribe(audio, model=self._whisper_model, language=self._language)
             _log(f"no_speech_prob={result.no_speech_prob:.3f}")
 
             if result.no_speech_prob > 0.6:

@@ -1000,19 +1000,34 @@ class MacOSTTSEngine:
         engine = MacOSTTSEngine()
         engine.speak("Hello, world!")
         engine.stop()
+
+        # German
+        engine = MacOSTTSEngine(backend=..., language='de')
+        engine.speak("Hallo Welt!")
     """
 
     _VOICE = 'af_heart'
     _SPEED = 1.2
     _REPO_ID = 'hexgrad/Kokoro-82M'
 
-    def __init__(self, backend: "AVAudioBackend") -> None:
-        if KPipeline is None:  # pragma: no cover
-            raise ImportError(
-                "kokoro is required for MacOSTTSEngine. "
-                "Install it with: pip install kokoro"
-            )
-        self._pipeline = KPipeline(lang_code='a', repo_id=self._REPO_ID)
+    def __init__(self, backend: "AVAudioBackend", language: str = 'en') -> None:
+        from lazy_claude.tts import _KOKORO_LANG_MAP
+
+        self._language = language.lower()
+        self._use_kokoro = self._language in _KOKORO_LANG_MAP
+
+        if self._use_kokoro:
+            if KPipeline is None:  # pragma: no cover
+                raise ImportError(
+                    "kokoro is required for MacOSTTSEngine. "
+                    "Install it with: pip install kokoro"
+                )
+            kokoro_lang = _KOKORO_LANG_MAP[self._language]
+            self._pipeline = KPipeline(lang_code=kokoro_lang, repo_id=self._REPO_ID)
+        else:
+            self._pipeline = None
+            _log(f"MacOSTTSEngine: language '{language}' — using external TTS.")
+
         self._backend = backend
         self._speaking = False
         self._stop_event = threading.Event()
@@ -1040,7 +1055,10 @@ class MacOSTTSEngine:
         self._stop_event.clear()
         self._speaking = True
         try:
-            self._stream_speak(text)
+            if self._use_kokoro:
+                self._stream_speak(text)
+            else:
+                self._stream_speak_external(text)
         finally:
             self._speaking = False
 
@@ -1056,6 +1074,48 @@ class MacOSTTSEngine:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _stream_speak_external(self, text: str) -> None:
+        """Speak *text* via espeak-ng / macOS say, playing through AVAudioBackend.
+
+        Generates audio with an external TTS tool, resamples to 24kHz, then
+        feeds it to the AVAudioBackend so system AEC still works correctly.
+        """
+        from lazy_claude.tts import _generate_audio_external, _SAMPLE_RATE as TTS_RATE
+
+        if self._stop_event.is_set():
+            return
+        try:
+            audio, src_rate = _generate_audio_external(text, self._language)
+        except Exception as exc:
+            _log(f"ERROR: external TTS failed: {exc}")
+            return
+
+        if self._stop_event.is_set():
+            return
+
+        # Resample to 24kHz (the rate play_audio expects)
+        if src_rate != TTS_RATE:
+            audio = resample_audio(audio, src_rate, TTS_RATE)
+
+        # Feed in 100 ms chunks so stop_event can be checked between them
+        chunk_size = TTS_RATE // 10
+        done_event = threading.Event()
+
+        chunks = [audio[i:i + chunk_size] for i in range(0, len(audio), chunk_size)]
+        if not chunks:
+            return
+
+        for i, chunk in enumerate(chunks):
+            if self._stop_event.is_set():
+                return
+            is_last = (i == len(chunks) - 1)
+            if is_last:
+                self._backend.play_audio(chunk, completion_handler=lambda: done_event.set())
+            else:
+                self._backend.play_audio(chunk)
+
+        done_event.wait(timeout=30.0)
 
     def _stream_speak(self, text: str) -> None:
         """Run the Kokoro generator and feed each chunk to the backend.

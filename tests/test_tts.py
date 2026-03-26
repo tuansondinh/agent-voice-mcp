@@ -47,20 +47,6 @@ class TestTTSModuleAPI:
         from lazy_claude.tts import TTSEngine
         assert TTSEngine is not None
 
-    def test_speak_callable(self):
-        from lazy_claude.tts import TTSEngine
-        assert callable(TTSEngine.speak)
-
-    def test_stop_callable(self):
-        from lazy_claude.tts import TTSEngine
-        assert callable(TTSEngine.stop)
-
-    def test_is_speaking_property_exists(self):
-        from lazy_claude.tts import TTSEngine
-        # is_speaking should be accessible as property or attribute on instances
-        # Verify it's defined as a property on the class
-        assert hasattr(TTSEngine, 'is_speaking')
-
 
 class TestTTSEngineInit:
     """Test TTSEngine construction with mocked dependencies."""

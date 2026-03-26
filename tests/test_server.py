@@ -284,7 +284,7 @@ class TestAskUserVoiceSuccess:
         answers = ["Paris", "42"]
         transcribe_count = [0]
 
-        def mock_transcribe(a, model=None):
+        def mock_transcribe(a, model=None, **kwargs):
             idx = min(transcribe_count[0], len(answers) - 1)
             transcribe_count[0] += 1
             return TranscribeResult(text=answers[idx], no_speech_prob=0.1)
@@ -556,7 +556,7 @@ class TestNoSpeechProbFilter:
             TranscribeResult(text=second_text, no_speech_prob=0.1),
         ]
 
-        def mock_transcribe(a, model=None):
+        def mock_transcribe(a, model=None, **kwargs):
             idx = min(call_count[0], len(results) - 1)
             call_count[0] += 1
             return results[idx]

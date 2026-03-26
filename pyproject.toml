@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-voice-mcp"
+name = "agent-voice"
 version = "0.1.2"
 description = "Turn-based voice MCP server for Claude Code and Codex"
 readme = "README.md"

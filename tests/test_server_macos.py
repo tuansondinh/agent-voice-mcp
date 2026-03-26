@@ -94,6 +94,7 @@ def _build_voice_server_directly(use_macos_aec: bool, next_speech=None):
     from lazy_claude.server import VoiceServer
     s = VoiceServer.__new__(VoiceServer)
     s._use_macos_aec = use_macos_aec
+    s._language = 'en'
     s.tts = mock_tts
     s._listener = mock_listener
     s._whisper_model = MagicMock()
@@ -545,6 +546,7 @@ class TestTryInitMacOSBackend:
         """Build a bare VoiceServer without calling __init__."""
         from lazy_claude.server import VoiceServer
         s = VoiceServer.__new__(VoiceServer)
+        s._language = 'en'
         return s
 
     def test_returns_false_on_backend_runtime_error(self):

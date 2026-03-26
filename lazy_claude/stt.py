@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MODEL = "small.en"
+_DEFAULT_MODEL_MULTILINGUAL = "small"  # multilingual Whisper model for non-English STT
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +147,27 @@ def _strip_artifacts(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def model_name_for_language(language: str) -> str:
+    """Return the appropriate Whisper model name for *language*.
+
+    English uses the English-only ``small.en`` model (faster, more accurate).
+    Other languages require the multilingual ``small`` model.
+
+    Parameters
+    ----------
+    language:
+        BCP-47 language code, e.g. ``'en'`` or ``'de'``.
+
+    Returns
+    -------
+    str
+        Whisper model name to pass to :func:`load_model`.
+    """
+    if language.lower().startswith('en'):
+        return _DEFAULT_MODEL
+    return _DEFAULT_MODEL_MULTILINGUAL
+
+
 def load_model(model_name: str = _DEFAULT_MODEL) -> "Model":
     """Return a ready-to-use pywhispercpp Model instance.
 
@@ -156,7 +178,7 @@ def load_model(model_name: str = _DEFAULT_MODEL) -> "Model":
     ----------
     model_name:
         One of the pywhispercpp AVAILABLE_MODELS, e.g. ``"base.en"``,
-        ``"small"``, ``"medium.en"``.  Default is ``"base.en"``.
+        ``"small"``, ``"medium.en"``.  Default is ``"small.en"``.
 
     Returns
     -------
@@ -191,6 +213,7 @@ def transcribe(
     *,
     model: "Model | None" = None,
     model_name: str = _DEFAULT_MODEL,
+    language: str = 'en',
 ) -> TranscribeResult:
     """Transcribe a 16 kHz mono float32 audio array.
 
@@ -202,7 +225,13 @@ def transcribe(
         Pre-loaded Model instance.  If not provided, one is loaded via
         ``load_model(model_name)``.
     model_name:
-        Model name to use when ``model`` is not provided.
+        Model name to use when ``model`` is not provided.  Ignored when
+        *model* is given.  Defaults to ``small.en`` (English-only model).
+        Pass ``model_name=model_name_for_language(lang)`` for other languages.
+    language:
+        BCP-47 language hint passed to Whisper, e.g. ``'de'`` for German.
+        ``'en'`` (default) uses English-only fast path.  Set to ``'auto'`` for
+        automatic detection (slower).
 
     Returns
     -------
@@ -227,13 +256,22 @@ def transcribe(
 
     _log(f"Transcribing {len(audio) / 16_000:.2f}s of audio …")
 
+    # Build whisper.cpp params — pass language hint when not English so the
+    # model skips its auto-detection step and decodes directly in the target language.
+    transcribe_params: dict = dict(
+        print_progress=False,
+        print_realtime=False,
+        print_timestamps=False,
+        print_special=False,
+    )
+    lang_lower = language.lower()
+    if lang_lower not in ('en', 'english', ''):
+        transcribe_params['language'] = lang_lower
+
     try:
         segments = model.transcribe(
             audio,
-            print_progress=False,
-            print_realtime=False,
-            print_timestamps=False,
-            print_special=False,
+            **transcribe_params,
         )
     except Exception as exc:  # noqa: BLE001
         _log(f"ERROR during transcription: {exc}")
