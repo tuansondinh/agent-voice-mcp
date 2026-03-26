@@ -1,0 +1,322 @@
+"""bridge.py — FastAPI voice bridge server.
+
+WebSocket-based server that connects a phone browser to Claude Code CLI
+with voice I/O. Audio is processed on the PC (Whisper STT, Kokoro TTS),
+text is piped to/from Claude CLI.
+
+Run via: agent-voice-bridge (or python -m lazy_claude.bridge_main)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import secrets
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+
+from lazy_claude.audio import load_vad_model
+from lazy_claude.bridge_claude import ClaudeSession
+from lazy_claude.bridge_tts import SAMPLE_RATE as TTS_SAMPLE_RATE
+from lazy_claude.bridge_tts import BufferedTTSEngine
+from lazy_claude.bridge_vad import RemoteVADProcessor
+from lazy_claude.stt import load_model as load_whisper_model
+from lazy_claude.stt import transcribe
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+AUTH_TOKEN = secrets.token_hex(32)
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+# Sentence boundary pattern for incremental TTS
+_SENTENCE_RE = re.compile(r"(?<=[.!?\n])\s+")
+
+# Maximum chars to buffer before forcing a TTS chunk
+_MAX_SENTENCE_CHARS = 150
+
+
+def _log(msg: str) -> None:
+    print(f"[bridge] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Voice Bridge", docs_url=None, redoc_url=None)
+
+# Shared models (loaded once at startup via lifespan or on first connect)
+_models: dict[str, Any] = {}
+_active_session: BridgeSession | None = None
+
+
+class BridgeSession:
+    """Manages one phone-to-PC voice session over WebSocket."""
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self._vad_processor = RemoteVADProcessor(
+            _models["vad"],
+            silence_duration=0.5,
+            min_speech_duration=0.3,
+            no_speech_timeout=30.0,
+        )
+        self._tts = _models["tts"]
+        self._whisper_model = _models["whisper"]
+        self._claude = ClaudeSession()
+        self._tts_task: asyncio.Task | None = None
+        self._stop_tts = asyncio.Event()
+
+    async def run(self) -> None:
+        """Main session loop: receive audio, process speech, respond."""
+        await self._send_json({"type": "ready"})
+        _log("Session started")
+
+        try:
+            while True:
+                message = await self.ws.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                # Binary: PCM audio from phone
+                if "bytes" in message and message["bytes"]:
+                    await self._handle_audio(message["bytes"])
+
+                # Text/JSON: control messages
+                elif "text" in message and message["text"]:
+                    import json
+                    try:
+                        data = json.loads(message["text"])
+                        await self._handle_control(data)
+                    except json.JSONDecodeError:
+                        pass
+
+        except WebSocketDisconnect:
+            _log("Client disconnected")
+        except Exception as exc:
+            _log(f"Session error: {exc}")
+        finally:
+            self._claude.cancel()
+            if self._tts_task and not self._tts_task.done():
+                self._tts_task.cancel()
+            _log("Session ended")
+
+    async def _handle_audio(self, data: bytes) -> None:
+        """Process incoming PCM audio from the phone."""
+        # Convert Int16LE bytes to float32
+        pcm_int16 = np.frombuffer(data, dtype=np.int16)
+        pcm_float = pcm_int16.astype(np.float32) / 32768.0
+
+        # Feed to VAD
+        utterance, is_speaking = self._vad_processor.feed(pcm_float)
+
+        # Send VAD state to phone for visual feedback
+        await self._send_json({"type": "vad_state", "speaking": is_speaking})
+
+        if utterance is not None:
+            await self._process_utterance(utterance)
+
+    async def _handle_control(self, data: dict) -> None:
+        """Handle control messages from the phone."""
+        msg_type = data.get("type")
+
+        if msg_type == "stop_tts":
+            self._stop_tts.set()
+            self._tts.stop()
+            _log("TTS interrupted by client")
+
+    async def _process_utterance(self, audio: np.ndarray) -> None:
+        """Transcribe speech, send to Claude, stream TTS back."""
+        loop = asyncio.get_event_loop()
+
+        # 1. Transcribe with Whisper (blocking, run in executor)
+        result = await loop.run_in_executor(
+            None, lambda: transcribe(audio, model=self._whisper_model)
+        )
+
+        if not result.text or result.no_speech_prob > 0.6:
+            _log(f"Discarding noise (no_speech_prob={result.no_speech_prob:.2f})")
+            return
+
+        _log(f"User said: {result.text}")
+
+        # 2. Send transcript to phone
+        await self._send_json({"type": "transcript", "text": result.text})
+
+        # 3. Send to Claude and stream response with incremental TTS
+        await self._stream_claude_response(result.text)
+
+    async def _stream_claude_response(self, user_text: str) -> None:
+        """Send to Claude, stream text to phone, and do incremental TTS."""
+        self._stop_tts.clear()
+        full_response: list[str] = []
+        sentence_buffer = ""
+        tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        # Start TTS consumer task
+        tts_task = asyncio.create_task(self._tts_consumer(tts_queue))
+
+        try:
+            async for chunk in self._claude.send_message(user_text):
+                full_response.append(chunk)
+                await self._send_json({"type": "assistant_chunk", "text": chunk})
+
+                # Accumulate for sentence-level TTS
+                sentence_buffer += chunk
+                sentences = _SENTENCE_RE.split(sentence_buffer)
+
+                if len(sentences) > 1:
+                    # All but last are complete sentences
+                    for sentence in sentences[:-1]:
+                        sentence = sentence.strip()
+                        if sentence:
+                            await tts_queue.put(sentence)
+                    sentence_buffer = sentences[-1]
+                elif len(sentence_buffer) > _MAX_SENTENCE_CHARS:
+                    # Force TTS on long chunks without sentence boundaries
+                    await tts_queue.put(sentence_buffer.strip())
+                    sentence_buffer = ""
+
+            # Flush remaining text
+            if sentence_buffer.strip():
+                await tts_queue.put(sentence_buffer.strip())
+
+            # Signal TTS consumer to finish
+            await tts_queue.put(None)
+
+            response_text = "".join(full_response)
+            await self._send_json(
+                {"type": "assistant_done", "text": response_text}
+            )
+            _log(f"Claude responded: {response_text[:100]}...")
+
+        except Exception as exc:
+            _log(f"Error streaming Claude response: {exc}")
+            await tts_queue.put(None)
+        finally:
+            await tts_task
+
+    async def _tts_consumer(self, queue: asyncio.Queue[str | None]) -> None:
+        """Consume sentences from queue and stream TTS audio to phone."""
+        loop = asyncio.get_event_loop()
+
+        await self._send_json({"type": "tts_start"})
+
+        try:
+            while True:
+                sentence = await queue.get()
+                if sentence is None:
+                    break
+
+                if self._stop_tts.is_set():
+                    # Drain remaining items
+                    while not queue.empty():
+                        queue.get_nowait()
+                    break
+
+                # Synthesize in executor (blocking)
+                chunks = await loop.run_in_executor(
+                    None, lambda s=sentence: list(self._tts.synthesize(s))
+                )
+
+                for chunk in chunks:
+                    if self._stop_tts.is_set():
+                        break
+                    # Convert float32 to Int16LE for phone
+                    int16_data = (chunk * 32767).clip(-32768, 32767).astype(
+                        np.int16
+                    )
+                    await self.ws.send_bytes(int16_data.tobytes())
+
+        except Exception as exc:
+            _log(f"TTS consumer error: {exc}")
+        finally:
+            await self._send_json({"type": "tts_end"})
+
+    async def _send_json(self, data: dict) -> None:
+        """Send a JSON message to the phone, ignoring errors."""
+        try:
+            import json
+            await self.ws.send_text(json.dumps(data))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/")
+async def serve_ui(token: str = Query("")):
+    """Serve the mobile web UI."""
+    index_path = _STATIC_DIR / "index.html"
+    if not index_path.exists():
+        return HTMLResponse("<h1>Voice Bridge</h1><p>index.html not found</p>")
+    html = index_path.read_text()
+    return HTMLResponse(html)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "ready" if _models.get("whisper") else "loading",
+        "models_loaded": list(_models.keys()),
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str = Query("")):
+    """WebSocket endpoint for voice communication."""
+    global _active_session
+
+    # Auth check
+    if token != AUTH_TOKEN:
+        await ws.close(code=4001, reason="Invalid token")
+        _log(f"Rejected connection: invalid token")
+        return
+
+    # Single session enforcement
+    if _active_session is not None:
+        _log("Closing existing session for new connection")
+        try:
+            await _active_session.ws.close(code=4002, reason="Replaced by new connection")
+        except Exception:
+            pass
+
+    await ws.accept()
+    _log("WebSocket connected")
+
+    session = BridgeSession(ws)
+    _active_session = session
+
+    try:
+        await session.run()
+    finally:
+        _active_session = None
+
+
+def load_models() -> None:
+    """Eagerly load all ML models. Call at startup."""
+    _log("Loading models (this may take 10-15 seconds on first run)...")
+
+    _log("Loading VAD model...")
+    _models["vad"] = load_vad_model()
+
+    _log("Loading Whisper model...")
+    _models["whisper"] = load_whisper_model()
+
+    _log("Loading TTS engine...")
+    _models["tts"] = BufferedTTSEngine()
+
+    _log("All models loaded and ready.")

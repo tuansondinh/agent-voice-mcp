@@ -42,10 +42,15 @@ dev = [
     "pytest>=9.0.2",
 ]
 macos = ["pyobjc-framework-AVFoundation>=10.0"]
+bridge = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
 wakeword = []
 
 [project.scripts]
 agent-voice-mcp = "lazy_claude.__main__:main"
+agent-voice-bridge = "lazy_claude.bridge_main:run_bridge"
 
 [tool.hatch.build.targets.wheel]
 packages = ["lazy_claude"]
