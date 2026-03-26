@@ -68,6 +68,11 @@ def run_bridge() -> None:
     _log("  Open the Network URL on your phone to start.")
     _log("  (Both devices must be on the same WiFi network,")
     _log("   or use Tailscale/ngrok for remote access)")
+    _log("")
+    if args.host == "0.0.0.0":
+        _log("  WARNING: Server is bound to 0.0.0.0 and is reachable from")
+        _log("  any device on your network. The auth token provides basic")
+        _log("  protection. Use --host 127.0.0.1 to restrict to localhost.")
     _log("=" * 60)
     _log("")
 

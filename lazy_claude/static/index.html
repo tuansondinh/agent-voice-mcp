@@ -363,6 +363,9 @@ function handleMessage(msg) {
       addMessage('user', msg.text);
       setStatus('processing', 'Processing...');
       hint.textContent = 'Claude is thinking...';
+      // Stop recording while Claude is processing/responding to prevent
+      // the mic picking up TTS audio (echo/re-capture).
+      stopRecording();
       break;
 
     case 'assistant_chunk':
@@ -378,6 +381,8 @@ function handleMessage(msg) {
       stopBtn.classList.add('visible');
       playbackQueue = [];
       isPlayingAudio = false;
+      // Ensure mic is off while TTS is playing (half-duplex: prevents echo).
+      stopRecording();
       break;
 
     case 'tts_end':
@@ -390,6 +395,9 @@ function handleMessage(msg) {
         stopBtn.classList.remove('visible');
         setStatus('connected', 'Connected');
         hint.textContent = 'Tap to speak';
+        // Resume recording automatically after TTS finishes so the user
+        // can speak again without tapping the mic button.
+        startRecording();
       }, 500);
       break;
 
